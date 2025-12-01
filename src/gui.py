@@ -24,6 +24,8 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFormLayout,
     QAbstractItemView,
+    QSlider,
+    QWidgetAction,
 )
 from PySide6.QtCore import Qt, QTimer, QRect, QSize, QPoint
 from PySide6.QtGui import (
@@ -35,7 +37,7 @@ from PySide6.QtGui import (
     QTextCharFormat,
     QAction,
     QIcon,
-    QBrush
+    QBrush,
 )
 
 # Import your existing emulator logic
@@ -59,7 +61,7 @@ COLORS = {
     "selection": "#44475a",
     "input_bg": "#44475a",
     "modal_bg": "#343746",
-    "breakpoint": "#ff5555" # Red for breakpoints
+    "breakpoint": "#ff5555",  # Red for breakpoints
 }
 
 
@@ -155,7 +157,7 @@ class LineNumberArea(QWidget):
     def __init__(self, editor):
         super().__init__(editor)
         self.editor = editor
-        self.setCursor(Qt.PointingHandCursor) # Indicate clickable
+        self.setCursor(Qt.PointingHandCursor)  # Indicate clickable
 
     def sizeHint(self):
         return QSize(self.editor.line_number_area_width(), 0)
@@ -166,12 +168,24 @@ class LineNumberArea(QWidget):
     def mousePressEvent(self, event):
         # Handle clicks to toggle breakpoints
         if event.button() == Qt.LeftButton:
-            # Calculate which line was clicked
-            y_pos = event.pos().y()
-            cursor = self.editor.cursorForPosition(QPoint(0, y_pos))
+            # Map the clicked position into the editor's viewport coordinates
+            # so cursorForPosition uses the correct point.
+            editor_pt = self.mapTo(self.editor.viewport(), event.pos())
+            cursor = self.editor.cursorForPosition(editor_pt)
             block = cursor.block()
             line_num = block.blockNumber()
-            self.editor.toggle_breakpoint(line_num)
+            # Only toggle a breakpoint if that line contains an executable instruction
+            if self.editor.is_instruction_line(line_num):
+                self.editor.toggle_breakpoint(line_num)
+            else:
+                # Not an executable line; ignore toggling to avoid confusion
+                # Optional: Provide visual or console feedback via parent MainWindow
+                try:
+                    mw = self.editor.parent().parent()
+                    if hasattr(mw, "console_out"):
+                        mw.console_out.append(f"LOG> Line {line_num+1} is not an instruction; cannot set breakpoint.")
+                except Exception:
+                    pass
         super().mousePressEvent(event)
 
 
@@ -186,7 +200,7 @@ class CodeEditor(QPlainTextEdit):
 
         self.execution_line_index = -1
         self.show_execution_highlight = True
-        
+
         # Set to store line numbers (0-indexed) that have breakpoints
         self.breakpoints = set()
 
@@ -198,7 +212,7 @@ class CodeEditor(QPlainTextEdit):
     def line_number_area_width(self):
         digits = len(str(max(1, self.blockCount())))
         space = 3 + self.fontMetrics().horizontalAdvance("9") * digits
-        return space + 20 # Increased width for breakpoint circles
+        return space + 20  # Increased width for breakpoint circles
 
     def update_line_number_area_width(self, _):
         self.setViewportMargins(self.line_number_area_width(), 0, 0, 0)
@@ -219,13 +233,37 @@ class CodeEditor(QPlainTextEdit):
         self.line_number_area.setGeometry(
             QRect(cr.left(), cr.top(), self.line_number_area_width(), cr.height())
         )
-    
+
     def toggle_breakpoint(self, line_num):
         if line_num in self.breakpoints:
             self.breakpoints.remove(line_num)
         else:
             self.breakpoints.add(line_num)
         self.line_number_area.update()
+
+    def is_instruction_line(self, line_num: int) -> bool:
+        """Return True if the provided line number contains an executable instruction.
+
+        This mirrors the logic used by `build_sourcemap()` in MainWindow to identify
+        which lines are actual instructions (and thus can have breakpoints).
+        """
+        if line_num < 0:
+            return False
+        block = self.document().findBlockByNumber(line_num)
+        if not block.isValid():
+            return False
+        text = block.text().split(";")[0].strip()
+        if not text:
+            return False
+        # Ignore labels and ORG and variable defs
+        if text.endswith(":"):
+            return False
+        if text.upper().startswith("ORG"):
+            return False
+        if "=" in text:
+            return False
+        # Otherwise we consider it an instruction
+        return True
 
     def set_execution_line(self, line_idx):
         self.execution_line_index = line_idx
@@ -271,14 +309,14 @@ class CodeEditor(QPlainTextEdit):
         block_number = block.blockNumber()
         top = self.blockBoundingGeometry(block).translated(self.contentOffset()).top()
         bottom = top + self.blockBoundingRect(block).height()
-        
+
         height = self.fontMetrics().height()
 
         while block.isValid() and top <= event.rect().bottom():
             if block.isVisible() and bottom >= event.rect().top():
                 number = str(block_number + 1)
                 painter.setPen(QColor(COLORS["comment"]))
-                
+
                 # Check for Breakpoint
                 if block_number in self.breakpoints:
                     painter.setBrush(QBrush(QColor(COLORS["breakpoint"])))
@@ -288,9 +326,9 @@ class CodeEditor(QPlainTextEdit):
                     cy = top + height / 2 - 2
                     cx = 8
                     painter.drawEllipse(QPoint(int(cx), int(cy)), radius, radius)
-                    
+
                     # Reset Pen for text
-                    painter.setPen(QColor(COLORS["fg"])) 
+                    painter.setPen(QColor(COLORS["fg"]))
 
                 # Highlight if executing
                 if (
@@ -327,6 +365,8 @@ class MainWindow(QMainWindow):
         self.emu = PicoEmulator()
         self.timer = QTimer()
         self.timer.timeout.connect(self.step_execution)
+        # Default timer interval (ms) for auto-run, controlled by slider
+        self.timer.setInterval(100)
 
         self.current_file_path = None
         self.table_items_cache = {}
@@ -437,9 +477,48 @@ class MainWindow(QMainWindow):
         self.act_step.setEnabled(False)
         toolbar.addAction(self.act_step)
 
-        reset_act = QAction("Reset", self)
-        reset_act.triggered.connect(self.reset_program)
-        toolbar.addAction(reset_act)
+        # Soft Reset: reset PC to start (keep memory)
+        reset_soft_act = QAction("Soft Reset", self)
+        reset_soft_act.triggered.connect(self.soft_reset_program)
+        reset_soft_act.setToolTip("Soft Reset — Reset PC to start address and keep memory & registers")
+        toolbar.addAction(reset_soft_act)
+
+        # Hard Reset: reload program and wipe memory/registers
+        reset_hard_act = QAction("Hard Reset", self)
+        reset_hard_act.triggered.connect(self.hard_reset_program)
+        reset_hard_act.setToolTip("Hard Reset — Wipe memory and reload program from editor")
+        toolbar.addAction(reset_hard_act)
+
+        # The 'Reset' legacy toolbar action was removed in favor of explicit 'Soft Reset' and 'Hard Reset'
+
+        # Execution speed slider (10ms - 1000ms)
+        self.speed_slider = QSlider(Qt.Horizontal)
+        self.speed_slider.setMinimum(10)
+        self.speed_slider.setMaximum(1000)
+        self.speed_slider.setValue(100)
+        self.speed_slider.setSingleStep(10)
+        self.speed_slider.setTickInterval(10)
+        self.speed_slider.setToolTip("Execution interval (ms) — Drag to adjust or type value in box")
+        self.speed_slider.valueChanged.connect(self.on_speed_change)
+
+        self.lbl_speed = QLabel(f"{self.speed_slider.value()} ms")
+        self.lbl_speed.setStyleSheet(f"color: {COLORS['cyan']}; font-weight: bold;")
+
+        speed_widget = QWidget()
+        sv_layout = QHBoxLayout(speed_widget)
+        sv_layout.setContentsMargins(0, 0, 0, 0)
+        sv_layout.addWidget(QLabel("Speed:"))
+        sv_layout.addWidget(self.speed_slider)
+        # Add a small QLineEdit next to the slider to allow typing the ms interval
+        self.speed_input = QLineEdit(str(self.speed_slider.value()))
+        self.speed_input.setMaximumWidth(70)
+        self.speed_input.setToolTip("Manual input of interval in ms")
+        self.speed_input.returnPressed.connect(self.on_speed_input)
+        sv_layout.addWidget(self.speed_input)
+        sv_layout.addWidget(self.lbl_speed)
+        speed_action = QWidgetAction(self)
+        speed_action.setDefaultWidget(speed_widget)
+        toolbar.addAction(speed_action)
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -476,11 +555,15 @@ class MainWindow(QMainWindow):
         self.lbl_status.setStyleSheet(f"color: {COLORS['pink']}; font-weight: bold;")
         self.lbl_pc = QLabel("PC: 000")
         self.lbl_pc.setStyleSheet(f"color: {COLORS['cyan']}; font-family: Consolas;")
+        # Cycles label (Phase 1 metric)
+        self.lbl_cycles = QLabel("CYCLES: 0")
+        self.lbl_cycles.setStyleSheet(f"color: {COLORS['yellow']}; font-family: Consolas; font-weight: bold;")
 
         status_layout.addWidget(QLabel("STATUS:"))
         status_layout.addWidget(self.lbl_status)
         status_layout.addStretch()
         status_layout.addWidget(self.lbl_pc)
+        status_layout.addWidget(self.lbl_cycles)
         right_layout.addWidget(status_frame)
 
         # Memory Table Configuration
@@ -643,9 +726,52 @@ STOP
             QMessageBox.critical(self, "Parse Error", str(e))
 
     def reset_program(self):
+        # Maintain backwards-compatible reset behavior -> hard reset
+        self.hard_reset_program()
+
+    def soft_reset_program(self):
+        """Soft reset: Reset PC to start address but keep memory and registers."""
+        self.timer.stop()
+        self.is_auto_running = False
+        try:
+            self.emu.soft_reset()
+            # Reset cycle counter on soft reset (user-facing metric)
+            self.emu.cycles = 0
+            self.console_out.append(">>> Soft Reset: PC reset; memory preserved.")
+            self.lbl_status.setText("READY")
+            self.lbl_status.setStyleSheet(f"color: {COLORS['green']}; font-weight: bold;")
+            self.editor.set_execution_line(self.pc_to_line_map.get(self.emu.pc, -1))
+            self.update_ui()
+        except Exception as e:
+            self.console_out.append(f"ERR> {str(e)}")
+
+    def hard_reset_program(self):
+        """Hard reset: Wipe memory and reload program from editor (default behavior)."""
         self.timer.stop()
         self.is_auto_running = False
         self.load_program()
+
+    def on_speed_change(self, value):
+        self.timer.setInterval(value)
+        self.lbl_speed.setText(f"{value} ms")
+        # Keep the speed input in sync
+        try:
+            self.speed_input.setText(str(value))
+        except Exception:
+            pass
+
+    def on_speed_input(self):
+        text = self.speed_input.text().strip()
+        try:
+            val = int(text)
+            if val < 10:
+                val = 10
+            if val > 1000:
+                val = 1000
+            self.speed_slider.setValue(val)
+            self.on_speed_change(val)
+        except ValueError:
+            QMessageBox.warning(self, "Invalid Interval", "Please enter a valid integer (10 - 1000).")
 
     def toggle_run(self):
         if self.timer.isActive():
@@ -665,13 +791,13 @@ STOP
             # to move off it, otherwise the timer will immediately pause again.
             current_line = self.pc_to_line_map.get(self.emu.pc, -1)
             if current_line in self.editor.breakpoints:
-                 self.emu.step()
-                 self.update_ui()
-                 if self.emu.is_finished or self.emu.input_needed > 0:
-                     return # Don't start timer if the single step finished it
+                self.emu.step()
+                self.update_ui()
+                if self.emu.is_finished or self.emu.input_needed > 0:
+                    return  # Don't start timer if the single step finished it
 
             self.is_auto_running = True
-            self.timer.start(100)
+            self.timer.start(self.timer.interval())
             self.act_run.setText("Stop")
             self.lbl_status.setText("RUNNING")
             self.lbl_status.setStyleSheet(
@@ -688,18 +814,18 @@ STOP
         # BREAKPOINT CHECK
         # We check BEFORE executing the current instruction
         current_line = self.pc_to_line_map.get(self.emu.pc, -1)
-        
-        # Only pause if we are in auto-run mode. 
+
+        # Only pause if we are in auto-run mode.
         # If the user clicked "Step", they expect it to execute regardless of breakpoint.
         if self.is_auto_running and current_line in self.editor.breakpoints:
             self.timer.stop()
             self.is_auto_running = False
             self.act_run.setText("Run")
             self.lbl_status.setText("BREAKPOINT")
-            self.lbl_status.setStyleSheet(
-                f"color: {COLORS['red']}; font-weight: bold;"
+            self.lbl_status.setStyleSheet(f"color: {COLORS['red']}; font-weight: bold;")
+            self.console_out.append(
+                f"LOG> Paused at Breakpoint (Line {current_line+1})"
             )
-            self.console_out.append(f"LOG> Paused at Breakpoint (Line {current_line+1})")
             # Highlight the line but don't execute
             self.editor.set_execution_line(current_line)
             return
@@ -738,6 +864,11 @@ STOP
 
     def update_ui(self):
         self.lbl_pc.setText(f"PC: {self.emu.pc}")
+        # Update cycles counter
+        try:
+            self.lbl_cycles.setText(f"CYCLES: {self.emu.cycles}")
+        except Exception:
+            self.lbl_cycles.setText("CYCLES: 0")
 
         # Block signals so our program updates don't trigger 'handle_memory_edit'
         self.mem_table.blockSignals(True)
@@ -862,7 +993,7 @@ STOP
                     self.lbl_status.setStyleSheet(
                         f"color: {COLORS['green']}; font-weight: bold;"
                     )
-                    self.timer.start(100)
+                    self.timer.start(self.timer.interval())
                 else:
                     self.lbl_status.setText("READY")
         else:

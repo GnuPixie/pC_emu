@@ -18,6 +18,8 @@ class PicoEmulator:
         self.input_needed = 0  # Koliko još brojeva se čeka
         self.input_dest_addr = 0  # Gde se upisuje input
         self.last_error = ""
+        self.cycles = 0  # Brojač ciklusa
+        self.start_pc = 0 # Početna adresa programa
 
     def parse(self, source_code):
         self.reset()
@@ -50,6 +52,7 @@ class PicoEmulator:
                     parts = line.split()
                     current_address = int(parts[1])
                     self.pc = current_address
+                    self.start_pc = current_address
                 except:
                     pass
                 continue
@@ -204,6 +207,8 @@ class PicoEmulator:
                     self.input_needed = count
                     self.input_dest_addr = addr
                     self.pc = next_pc
+                    # Count as an executed step
+                    self.cycles += 1
                     return
 
             elif opcode == "OUT":
@@ -256,10 +261,22 @@ class PicoEmulator:
                     self.output_buffer.append(f"STOP Result: {val}")
 
             self.pc = next_pc
+            # Successful instruction step -> increment cycles
+            self.cycles += 1
 
         except Exception as e:
             self.last_error = f"Greška linija {instr_data['line_no']}: {str(e)}"
             self.is_finished = True
+
+    def soft_reset(self):
+        """
+        Soft reset: reset PC to the start address but keep memory/registers intact.
+        Useful to re-run without losing data.
+        """
+        # set PC back to the start address (or 0 if not set)
+        self.pc = getattr(self, "start_pc", 0)
+        self.is_finished = False
+        self.last_error = ""
 
     def provide_input(self, value):
         if self.input_needed > 0:
