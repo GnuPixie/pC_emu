@@ -1,0 +1,22 @@
+[workspace]
+name = "pC_emu"
+version = "0.1.0"
+description = "Emulator za picoComputer sa GUI interfejsom"
+authors = ["Stefan Jovanović"]
+channels = ["conda-forge"]
+platforms = ["linux-64", "win-64", "osx-64", "osx-arm64"]
+
+[tasks]
+start = "python src/main.py"
+fmt = "black ."
+
+[dependencies]
+python = ">=3.9,<=3.14"
+pyside6 = "*"
+
+[feature.dev.dependencies]
+black = "*"
+
+[environments]
+default = { features = [] }
+dev = ["dev"]
