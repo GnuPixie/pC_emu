@@ -24,8 +24,14 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFormLayout,
     QAbstractItemView,
+    QSlider,
+    QSpinBox,
+    QCompleter,
+    QDockWidget,
+    QTreeWidget,
+    QTreeWidgetItem,
 )
-from PySide6.QtCore import Qt, QTimer, QRect, QSize, QPoint
+from PySide6.QtCore import Qt, QTimer, QRect, QSize, QPoint, QStringListModel
 from PySide6.QtGui import (
     QFont,
     QColor,
@@ -35,11 +41,11 @@ from PySide6.QtGui import (
     QTextCharFormat,
     QAction,
     QIcon,
-    QBrush
+    QBrush,
+    QTextCursor,
+    QKeySequence,
 )
 
-# Import your existing emulator logic
-# Assuming emulator.py is in the same directory
 from emulator import PicoEmulator
 
 # --- COLOR PALETTE (Dracula Inspired) ---
@@ -59,8 +65,26 @@ COLORS = {
     "selection": "#44475a",
     "input_bg": "#44475a",
     "modal_bg": "#343746",
-    "breakpoint": "#ff5555" # Red for breakpoints
+    "breakpoint": "#ff5555",
 }
+
+# --- OPCODE REFERENCE DATA ---
+# Removed JMP, CMP, BLT as requested
+OPCODE_REF = [
+    ("MOV", "MOV Dest, Src", "Copy value from Src to Dest"),
+    ("ADD", "ADD Dest, Src1, Src2", "Dest = Src1 + Src2"),
+    ("SUB", "SUB Dest, Src1, Src2", "Dest = Src1 - Src2"),
+    ("MUL", "MUL Dest, Src1, Src2", "Dest = Src1 * Src2"),
+    ("DIV", "DIV Dest, Src1, Src2", "Dest = Src1 // Src2"),
+    ("IN", "IN Addr, Count", "Read 'Count' inputs into Addr"),
+    ("OUT", "OUT Addr, Count", "Print 'Count' values from Addr"),
+    ("BEQ", "BEQ Val1, Val2, Label", "Branch to Label if Val1 == Val2"),
+    ("BGT", "BGT Val1, Val2, Label", "Branch to Label if Val1 > Val2"),
+    ("JSR", "JSR Label", "Jump to Subroutine"),
+    ("RTS", "RTS", "Return from Subroutine"),
+    ("STOP", "STOP [Val]", "End Execution"),
+    ("ORG", "ORG Address", "Set starting memory address"),
+]
 
 
 # --- SETTINGS DIALOG ---
@@ -107,22 +131,7 @@ class AssemblyHighlighter(QSyntaxHighlighter):
         super().__init__(parent)
         self.highlighting_rules = []
 
-        keywords = [
-            "MOV",
-            "ADD",
-            "SUB",
-            "MUL",
-            "DIV",
-            "IN",
-            "OUT",
-            "CMP",
-            "JMP",
-            "BEQ",
-            "BGT",
-            "BLT",
-            "STOP",
-            "ORG",
-        ]
+        keywords = [x[0] for x in OPCODE_REF]
         keyword_format = QTextCharFormat()
         keyword_format.setForeground(QColor(COLORS["pink"]))
         keyword_format.setFontWeight(QFont.Bold)
@@ -155,7 +164,7 @@ class LineNumberArea(QWidget):
     def __init__(self, editor):
         super().__init__(editor)
         self.editor = editor
-        self.setCursor(Qt.PointingHandCursor) # Indicate clickable
+        self.setCursor(Qt.PointingHandCursor)
 
     def sizeHint(self):
         return QSize(self.editor.line_number_area_width(), 0)
@@ -164,9 +173,7 @@ class LineNumberArea(QWidget):
         self.editor.lineNumberAreaPaintEvent(event)
 
     def mousePressEvent(self, event):
-        # Handle clicks to toggle breakpoints
         if event.button() == Qt.LeftButton:
-            # Calculate which line was clicked
             y_pos = event.pos().y()
             cursor = self.editor.cursorForPosition(QPoint(0, y_pos))
             block = cursor.block()
@@ -186,8 +193,6 @@ class CodeEditor(QPlainTextEdit):
 
         self.execution_line_index = -1
         self.show_execution_highlight = True
-        
-        # Set to store line numbers (0-indexed) that have breakpoints
         self.breakpoints = set()
 
         font = QFont("Consolas", 12)
@@ -195,10 +200,108 @@ class CodeEditor(QPlainTextEdit):
         self.setFont(font)
         self.highlight_lines()
 
+        # Autocomplete Setup
+        self.completer = None
+        self.setup_completer()
+
+    def setup_completer(self):
+        self.completer = QCompleter(self)
+        self.completer.setWidget(self)
+        self.completer.setCompletionMode(QCompleter.PopupCompletion)
+        self.completer.setCaseSensitivity(Qt.CaseInsensitive)
+
+        # Build keyword list
+        keywords = [x[0] for x in OPCODE_REF]
+        keywords += ["M", "N", "R", "A", "B", "I", "J"]
+        self.completer.setModel(QStringListModel(keywords, self.completer))
+        self.completer.activated.connect(self.insert_completion)
+
+    def insert_completion(self, completion):
+        if self.completer.widget() != self:
+            return
+
+        tc = self.textCursor()
+        extra = len(completion) - len(self.completer.completionPrefix())
+        tc.movePosition(QTextCursor.Left)
+        tc.movePosition(QTextCursor.EndOfWord)
+        tc.insertText(completion[-extra:])
+        self.setTextCursor(tc)
+
+    def text_under_cursor(self):
+        tc = self.textCursor()
+        tc.select(QTextCursor.WordUnderCursor)
+        return tc.selectedText()
+
+    def focusInEvent(self, event):
+        if self.completer:
+            self.completer.setWidget(self)
+        super().focusInEvent(event)
+
+    def keyPressEvent(self, event):
+        # 1. Handle Autocomplete Key Logic
+        if self.completer and self.completer.popup().isVisible():
+            if event.key() in (
+                Qt.Key_Tab,
+            ):
+                event.ignore()
+                return
+
+        # 2. Smart Indentation logic
+        if event.key() == Qt.Key_Return or event.key() == Qt.Key_Enter:
+            cursor = self.textCursor()
+            current_line = cursor.block().text()
+            indentation = ""
+            match = re.match(r"^(\s+)", current_line)
+            if match:
+                indentation = match.group(1)
+
+            # Use default handling for the newline, then insert spaces
+            super().keyPressEvent(event)
+            self.insertPlainText(indentation)
+            return
+
+        is_shortcut = (
+            event.modifiers() & Qt.ControlModifier
+        ) and event.key() == Qt.Key_Space
+        if not self.completer or not is_shortcut:
+            super().keyPressEvent(event)
+
+        # 3. Trigger Autocomplete Popup
+        ctrl_or_shift = event.modifiers() & (Qt.ControlModifier | Qt.ShiftModifier)
+        if not self.completer or (ctrl_or_shift and len(event.text()) == 0):
+            return
+
+        eow = "~!@#$%^&*()_+{}|:\"<>?,./;'[]\\-="
+        has_modifier = (event.modifiers() != Qt.NoModifier) and not ctrl_or_shift
+
+        completion_prefix = self.text_under_cursor()
+
+        if not is_shortcut and (
+            has_modifier
+            or not event.text()
+            or len(completion_prefix) < 1
+            or event.text()[-1] in eow
+        ):
+            self.completer.popup().hide()
+            return
+
+        if completion_prefix != self.completer.completionPrefix():
+            self.completer.setCompletionPrefix(completion_prefix)
+            self.completer.popup().setCurrentIndex(
+                self.completer.completionModel().index(0, 0)
+            )
+
+        cr = self.cursorRect()
+        cr.setWidth(
+            self.completer.popup().sizeHintForColumn(0)
+            + self.completer.popup().verticalScrollBar().sizeHint().width()
+        )
+        self.completer.complete(cr)
+
     def line_number_area_width(self):
         digits = len(str(max(1, self.blockCount())))
         space = 3 + self.fontMetrics().horizontalAdvance("9") * digits
-        return space + 20 # Increased width for breakpoint circles
+        return space + 20
 
     def update_line_number_area_width(self, _):
         self.setViewportMargins(self.line_number_area_width(), 0, 0, 0)
@@ -219,7 +322,7 @@ class CodeEditor(QPlainTextEdit):
         self.line_number_area.setGeometry(
             QRect(cr.left(), cr.top(), self.line_number_area_width(), cr.height())
         )
-    
+
     def toggle_breakpoint(self, line_num):
         if line_num in self.breakpoints:
             self.breakpoints.remove(line_num)
@@ -271,28 +374,23 @@ class CodeEditor(QPlainTextEdit):
         block_number = block.blockNumber()
         top = self.blockBoundingGeometry(block).translated(self.contentOffset()).top()
         bottom = top + self.blockBoundingRect(block).height()
-        
+
         height = self.fontMetrics().height()
 
         while block.isValid() and top <= event.rect().bottom():
             if block.isVisible() and bottom >= event.rect().top():
                 number = str(block_number + 1)
                 painter.setPen(QColor(COLORS["comment"]))
-                
-                # Check for Breakpoint
+
                 if block_number in self.breakpoints:
                     painter.setBrush(QBrush(QColor(COLORS["breakpoint"])))
                     painter.setPen(Qt.NoPen)
-                    # Draw a circle on the left side of the number area
                     radius = height / 3
                     cy = top + height / 2 - 2
                     cx = 8
                     painter.drawEllipse(QPoint(int(cx), int(cy)), radius, radius)
-                    
-                    # Reset Pen for text
-                    painter.setPen(QColor(COLORS["fg"])) 
+                    painter.setPen(QColor(COLORS["fg"]))
 
-                # Highlight if executing
                 if (
                     block_number == self.execution_line_index
                     and self.show_execution_highlight
@@ -316,12 +414,63 @@ class CodeEditor(QPlainTextEdit):
             block_number += 1
 
 
+# --- REFERENCE DOCK WIDGET ---
+class ReferenceDock(QDockWidget):
+    def __init__(self, parent=None, editor=None):
+        super().__init__("Instruction Set", parent)
+        self.editor = editor
+        self.setAllowedAreas(Qt.RightDockWidgetArea | Qt.LeftDockWidgetArea)
+
+        # Create Tree Widget
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(2)
+        self.tree.setHeaderLabels(["Opcode", "Description"])
+        self.tree.setColumnWidth(0, 70)
+        self.tree.setStyleSheet(
+            f"""
+            QTreeWidget {{
+                background-color: {COLORS['bg']};
+                color: {COLORS['fg']};
+                border: none;
+            }}
+            QHeaderView::section {{
+                background-color: {COLORS['current_line']};
+                color: {COLORS['cyan']};
+                padding: 4px;
+            }}
+            QTreeWidget::item:hover {{ background-color: {COLORS['current_line']}; }}
+            QTreeWidget::item:selected {{ background-color: {COLORS['selection']}; }}
+        """
+        )
+
+        for op, syntax, desc in OPCODE_REF:
+            item = QTreeWidgetItem([op, desc])
+            # Store syntax in data for tooltip or insertion
+            item.setData(0, Qt.UserRole, syntax)
+            item.setToolTip(0, syntax)
+            item.setToolTip(1, desc)
+            # Color styling
+            item.setForeground(0, QBrush(QColor(COLORS["pink"])))
+            self.tree.addTopLevelItem(item)
+
+        self.tree.itemDoubleClicked.connect(self.insert_instruction)
+        self.setWidget(self.tree)
+
+    def insert_instruction(self, item, column):
+        if not self.editor:
+            return
+        # Insert the Opcode text
+        opcode = item.text(0)
+        self.editor.insertPlainText(opcode + " ")
+        self.editor.setFocus()
+
+
 # --- MAIN WINDOW ---
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PicoComputer IDE")
-        self.resize(1200, 800)
+        self.resize(1300, 800)
         self.setWindowIcon(QIcon.fromTheme("system-run"))
 
         self.emu = PicoEmulator()
@@ -332,12 +481,20 @@ class MainWindow(QMainWindow):
         self.table_items_cache = {}
         self.pc_to_line_map = {}
         self.is_auto_running = False
+        self.cycle_count = 0
+
+        # Tracking "Dirty" state to ensure we always run latest code
+        self.is_code_dirty = True
+        self.program_entry_point = 0
 
         self.app_settings = {"highlight_execution": True}
 
         self.apply_styles()
         self.setup_ui()
         self.load_default_code()
+
+        # Connect editor change to dirty flag
+        self.editor.textChanged.connect(self.on_code_changed)
 
     def apply_styles(self):
         qss = f"""
@@ -364,12 +521,28 @@ class MainWindow(QMainWindow):
                 border: 1px solid {COLORS['bg']};
             }}
             
-            QLineEdit {{ 
+            QLineEdit, QSpinBox {{ 
                 background-color: {COLORS['input_bg']}; 
                 border: 1px solid {COLORS['comment']}; 
                 border-radius: 4px; 
                 padding: 5px; 
                 color: {COLORS['fg']};
+            }}
+            
+            QSlider::groove:horizontal {{
+                border: 1px solid {COLORS['current_line']};
+                height: 8px;
+                background: {COLORS['bg']};
+                margin: 2px 0;
+                border-radius: 4px;
+            }}
+            QSlider::handle:horizontal {{
+                background: {COLORS['cyan']};
+                border: 1px solid {COLORS['cyan']};
+                width: 18px;
+                height: 18px;
+                margin: -6px 0;
+                border-radius: 9px;
             }}
             
             QPushButton {{
@@ -386,16 +559,14 @@ class MainWindow(QMainWindow):
             
             QSplitter::handle {{ background-color: {COLORS['current_line']}; }}
             
-            QScrollBar:vertical {{
-                border: none;
-                background: {COLORS['bg']};
-                width: 10px;
-                margin: 0px;
+            QDockWidget {{
+                titlebar-close-icon: url(close.png);
+                titlebar-normal-icon: url(undock.png);
             }}
-            QScrollBar::handle:vertical {{
-                background: {COLORS['comment']};
-                min-height: 20px;
-                border-radius: 5px;
+            QDockWidget::title {{
+                text-align: left;
+                background: {COLORS['current_line']};
+                padding-left: 5px;
             }}
         """
         self.setStyleSheet(qss)
@@ -428,18 +599,53 @@ class MainWindow(QMainWindow):
         self.act_run = QAction("Run", self)
         self.act_run.setShortcut("F5")
         self.act_run.triggered.connect(self.toggle_run)
-        self.act_run.setEnabled(False)
+        # We start enabled so user can click run to auto-build
+        self.act_run.setEnabled(True)
         toolbar.addAction(self.act_run)
 
         self.act_step = QAction("Step", self)
         self.act_step.setShortcut("F10")
         self.act_step.triggered.connect(self.manual_step)
-        self.act_step.setEnabled(False)
+        self.act_step.setEnabled(False)  # Step needs valid build first
         toolbar.addAction(self.act_step)
 
+        # --- SPEED CONTROLS START ---
+        toolbar.addSeparator()
+
+        lbl_speed = QLabel(" Delay (ms): ")
+        lbl_speed.setStyleSheet(f"color: {COLORS['fg']}")
+        toolbar.addWidget(lbl_speed)
+
+        self.slider_speed = QSlider(Qt.Horizontal)
+        self.slider_speed.setRange(10, 1000)
+        self.slider_speed.setValue(100)
+        self.slider_speed.setFixedWidth(100)
+        self.slider_speed.valueChanged.connect(self.change_speed_from_slider)
+        toolbar.addWidget(self.slider_speed)
+
+        self.spin_speed = QSpinBox()
+        self.spin_speed.setRange(10, 1000)
+        self.spin_speed.setValue(100)
+        self.spin_speed.setFixedWidth(60)
+        self.spin_speed.valueChanged.connect(self.change_speed_from_spin)
+        toolbar.addWidget(self.spin_speed)
+        # --- SPEED CONTROLS END ---
+
+        toolbar.addSeparator()
+
+        # Hard Reset (The only Reset now)
         reset_act = QAction("Reset", self)
+        reset_act.setToolTip("Restart program from entry point")
         reset_act.triggered.connect(self.reset_program)
         toolbar.addAction(reset_act)
+
+        # View Toggle for Dock
+        toolbar.addSeparator()
+        self.view_dock_act = QAction("Ref", self)
+        self.view_dock_act.setCheckable(True)
+        self.view_dock_act.setChecked(True)
+        self.view_dock_act.triggered.connect(self.toggle_dock)
+        toolbar.addAction(self.view_dock_act)
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -474,12 +680,20 @@ class MainWindow(QMainWindow):
 
         self.lbl_status = QLabel("IDLE")
         self.lbl_status.setStyleSheet(f"color: {COLORS['pink']}; font-weight: bold;")
+
+        self.lbl_cycles = QLabel("CYCLES: 0")
+        self.lbl_cycles.setStyleSheet(
+            f"color: {COLORS['yellow']}; font-family: Consolas;"
+        )
+
         self.lbl_pc = QLabel("PC: 000")
         self.lbl_pc.setStyleSheet(f"color: {COLORS['cyan']}; font-family: Consolas;")
 
         status_layout.addWidget(QLabel("STATUS:"))
         status_layout.addWidget(self.lbl_status)
         status_layout.addStretch()
+        status_layout.addWidget(self.lbl_cycles)
+        status_layout.addSpacing(20)
         status_layout.addWidget(self.lbl_pc)
         right_layout.addWidget(status_frame)
 
@@ -494,7 +708,6 @@ class MainWindow(QMainWindow):
         self.mem_table.setAlternatingRowColors(True)
         self.mem_table.setStyleSheet(f"alternate-background-color: #2e303e;")
 
-        # Connect signal for editing
         self.mem_table.itemChanged.connect(self.handle_memory_edit)
 
         right_layout.addWidget(self.mem_table)
@@ -529,6 +742,34 @@ class MainWindow(QMainWindow):
         splitter.setSizes([700, 400])
         main_layout.addWidget(splitter)
 
+        # --- REFERENCE DOCK ---
+        self.dock = ReferenceDock(self, self.editor)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.dock)
+
+    # --- DOCK LOGIC ---
+    def toggle_dock(self):
+        if self.dock.isVisible():
+            self.dock.close()
+        else:
+            self.dock.show()
+
+    # --- SPEED CONTROL LOGIC ---
+    def change_speed_from_slider(self, value):
+        self.spin_speed.blockSignals(True)
+        self.spin_speed.setValue(value)
+        self.spin_speed.blockSignals(False)
+        self.update_timer_interval(value)
+
+    def change_speed_from_spin(self, value):
+        self.slider_speed.blockSignals(True)
+        self.slider_speed.setValue(value)
+        self.slider_speed.blockSignals(False)
+        self.update_timer_interval(value)
+
+    def update_timer_interval(self, value):
+        if self.timer.isActive():
+            self.timer.setInterval(value)
+
     # --- LOGIC ---
     def open_settings(self):
         dlg = SettingsDialog(self, self.app_settings)
@@ -538,6 +779,14 @@ class MainWindow(QMainWindow):
                 "highlight_execution"
             ]
             self.editor.highlight_lines()
+
+    def on_code_changed(self):
+        self.is_code_dirty = True
+        self.lbl_status.setText("MODIFIED")
+        self.lbl_status.setStyleSheet(f"color: {COLORS['orange']}; font-weight: bold;")
+        # We don't disable Run, because Run will now auto-build.
+        # We disable Step because stepping on dirty code is confusing.
+        self.act_step.setEnabled(False)
 
     def load_default_code(self):
         default_code = """; Click left margin to toggle breakpoints
@@ -558,6 +807,8 @@ OUT M, 1     ; Output
 STOP
 """
         self.editor.setPlainText(default_code)
+        # Manually load it so the entry point is calculated
+        self.load_program()
 
     def open_file(self):
         file_path, _ = QFileDialog.getOpenFileName(
@@ -571,6 +822,7 @@ STOP
                 self.editor.setPlainText(f.read())
             self.current_file_path = file_path
             self.console_out.append(f">>> Loaded: {file_path}")
+            self.load_program()
 
     def save_file(self):
         if not self.current_file_path:
@@ -618,36 +870,71 @@ STOP
                 current_address += 1
 
     def load_program(self):
+        # 1. Sanitize Input
         code = self.editor.toPlainText()
+
         try:
+            # 2. Parse Code
             self.emu.parse(code)
             self.build_sourcemap(code)
 
+            # 3. Determine Entry Point
+            # The emulator.parse method leaves self.emu.pc at the ORG address
+            # (if defined) because of how ORG directives set pc.
+            # We capture this value now as the definitive reset point.
+            self.program_entry_point = self.emu.pc
+
             self.console_out.clear()
-            self.console_out.append(">>> Build Successful. Ready.")
+            self.console_out.append(
+                f">>> Build Successful. Entry Point: {self.program_entry_point}"
+            )
+
             self.act_run.setEnabled(True)
             self.act_step.setEnabled(True)
             self.lbl_status.setText("READY")
             self.lbl_status.setStyleSheet(
                 f"color: {COLORS['green']}; font-weight: bold;"
             )
+
             self.mem_table.setRowCount(0)
             self.table_items_cache = {}
             self.editor.set_execution_line(-1)
             self.is_auto_running = False
+            self.is_code_dirty = False
+
+            # Reset Cycle Count
+            self.cycle_count = 0
             self.update_ui()
+
+            return True
+
         except Exception as e:
             self.console_out.append(f"ERR> {str(e)}")
             self.lbl_status.setText("PARSE ERROR")
             self.lbl_status.setStyleSheet(f"color: {COLORS['red']}; font-weight: bold;")
             QMessageBox.critical(self, "Parse Error", str(e))
+            return False
 
     def reset_program(self):
+        """Re-loads the program to ensure memory is wiped and state is fresh."""
         self.timer.stop()
         self.is_auto_running = False
-        self.load_program()
+        self.act_run.setText("Run")
+
+        # Reloading ensures 'Hard Reset' behavior (Memory Cleared)
+        if self.load_program():
+            # Force PC to entry point in case load_program didn't set it
+            # (though load_program usually sets it via parse)
+            self.emu.pc = self.program_entry_point
+            self.update_ui()
 
     def toggle_run(self):
+        # Auto-Build if dirty
+        if self.is_code_dirty:
+            success = self.load_program()
+            if not success:
+                return  # Do not run if build failed
+
         if self.timer.isActive():
             self.timer.stop()
             self.is_auto_running = False
@@ -658,20 +945,27 @@ STOP
             )
         else:
             if self.emu.is_finished:
-                self.reset_program()
+                # If finished, we reset to entry point
+                self.emu.pc = self.program_entry_point
+                self.emu.is_finished = False
+                self.emu.input_needed = 0
+                self.cycle_count = 0
+                self.emu.output_buffer = []
+                self.console_out.append(">>> Restarting...")
 
             # Logic to handle starting ON a breakpoint
-            # If we are currently paused on a breakpoint, we need to step once
-            # to move off it, otherwise the timer will immediately pause again.
             current_line = self.pc_to_line_map.get(self.emu.pc, -1)
             if current_line in self.editor.breakpoints:
-                 self.emu.step()
-                 self.update_ui()
-                 if self.emu.is_finished or self.emu.input_needed > 0:
-                     return # Don't start timer if the single step finished it
+                self.step_execution()  # Step once to get off breakpoint
+                if (
+                    self.emu.is_finished
+                    or self.emu.input_needed > 0
+                    or not self.is_auto_running
+                ):
+                    return
 
             self.is_auto_running = True
-            self.timer.start(100)
+            self.timer.start(self.slider_speed.value())
             self.act_run.setText("Stop")
             self.lbl_status.setText("RUNNING")
             self.lbl_status.setStyleSheet(
@@ -679,43 +973,47 @@ STOP
             )
 
     def manual_step(self):
+        if self.is_code_dirty:
+            success = self.load_program()
+            if not success:
+                return
+
         self.timer.stop()
         self.is_auto_running = False
         self.act_run.setText("Run")
         self.step_execution()
 
     def step_execution(self):
-        # BREAKPOINT CHECK
-        # We check BEFORE executing the current instruction
+        # 1. Breakpoint Check
         current_line = self.pc_to_line_map.get(self.emu.pc, -1)
-        
-        # Only pause if we are in auto-run mode. 
-        # If the user clicked "Step", they expect it to execute regardless of breakpoint.
         if self.is_auto_running and current_line in self.editor.breakpoints:
             self.timer.stop()
             self.is_auto_running = False
             self.act_run.setText("Run")
             self.lbl_status.setText("BREAKPOINT")
-            self.lbl_status.setStyleSheet(
-                f"color: {COLORS['red']}; font-weight: bold;"
+            self.lbl_status.setStyleSheet(f"color: {COLORS['red']}; font-weight: bold;")
+            self.console_out.append(
+                f"LOG> Paused at Breakpoint (Line {current_line+1})"
             )
-            self.console_out.append(f"LOG> Paused at Breakpoint (Line {current_line+1})")
-            # Highlight the line but don't execute
             self.editor.set_execution_line(current_line)
             return
 
+        # 2. Status Check (Fix for Cycle Counting Issue)
+        # If already finished or waiting, do not step and do not increment cycles
+        if self.emu.is_finished or self.emu.input_needed > 0:
+            self.update_ui()
+            return
+
+        # 3. Perform Step
         self.emu.step()
+        self.cycle_count += 1
         self.update_ui()
 
     def handle_memory_edit(self, item):
-        """Handle user edits to the memory table."""
-        # Column 2 is the Value column
         if item.column() != 2:
             return
 
         row = item.row()
-
-        # Get address from column 1
         addr_item = self.mem_table.item(row, 1)
         if not addr_item:
             return
@@ -725,7 +1023,6 @@ STOP
             new_val_str = item.text()
             new_val = int(new_val_str)
 
-            # Update emulator memory securely
             if isinstance(self.emu.memory, list):
                 if 0 <= addr < len(self.emu.memory):
                     self.emu.memory[addr] = new_val
@@ -733,13 +1030,12 @@ STOP
 
         except ValueError:
             QMessageBox.warning(self, "Invalid Value", "Please enter a valid integer.")
-            # Revert the table visually in the next update or immediately
             self.update_ui()
 
     def update_ui(self):
         self.lbl_pc.setText(f"PC: {self.emu.pc}")
+        self.lbl_cycles.setText(f"CYCLES: {self.cycle_count}")
 
-        # Block signals so our program updates don't trigger 'handle_memory_edit'
         self.mem_table.blockSignals(True)
 
         if self.app_settings["highlight_execution"]:
@@ -755,7 +1051,7 @@ STOP
                 )
             self.emu.output_buffer = []
 
-        # Status checks (Finished/Input)
+        # Status checks
         if self.emu.is_finished:
             self.timer.stop()
             self.is_auto_running = False
@@ -799,7 +1095,6 @@ STOP
             self.mem_table.setRowCount(len(registers_list))
 
         for row, (name, addr) in enumerate(registers_list):
-            # Safe memory access
             try:
                 if isinstance(self.emu.memory, list):
                     if 0 <= addr < len(self.emu.memory):
@@ -816,33 +1111,27 @@ STOP
                 i_addr = QTableWidgetItem(str(addr))
                 i_val = QTableWidgetItem(str(val))
 
-                # Styling
                 i_name.setForeground(QColor(COLORS["orange"]))
-                i_name.setFlags(i_name.flags() & ~Qt.ItemIsEditable)  # Name Read-only
+                i_name.setFlags(i_name.flags() & ~Qt.ItemIsEditable)
 
                 i_addr.setTextAlignment(Qt.AlignCenter)
-                i_addr.setFlags(i_addr.flags() & ~Qt.ItemIsEditable)  # Addr Read-only
+                i_addr.setFlags(i_addr.flags() & ~Qt.ItemIsEditable)
 
                 i_val.setTextAlignment(Qt.AlignCenter)
                 i_val.setForeground(QColor(COLORS["cyan"]))
-                i_val.setFlags(i_val.flags() | Qt.ItemIsEditable)  # Val Editable
+                i_val.setFlags(i_val.flags() | Qt.ItemIsEditable)
 
                 self.mem_table.setItem(row, 0, i_name)
                 self.mem_table.setItem(row, 1, i_addr)
                 self.mem_table.setItem(row, 2, i_val)
                 self.table_items_cache[row] = (i_name, i_addr, i_val)
 
-            # Update only if not currently editing (optional safeguard, but blockSignals handles most)
-            # We force update to keep sync with emulator steps
             self.table_items_cache[row][0].setText(name)
             self.table_items_cache[row][1].setText(str(addr))
 
-            # Only update text if the value actually changed to avoid cursor jumping if we weren't blocking signals
-            # Since we block signals, we can safely set text.
             if self.table_items_cache[row][2].text() != str(val):
                 self.table_items_cache[row][2].setText(str(val))
 
-        # Unblock signals
         self.mem_table.blockSignals(False)
 
     def handle_input(self):
@@ -862,7 +1151,7 @@ STOP
                     self.lbl_status.setStyleSheet(
                         f"color: {COLORS['green']}; font-weight: bold;"
                     )
-                    self.timer.start(100)
+                    self.timer.start(self.slider_speed.value())
                 else:
                     self.lbl_status.setText("READY")
         else:
