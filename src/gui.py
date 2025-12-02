@@ -240,9 +240,7 @@ class CodeEditor(QPlainTextEdit):
     def keyPressEvent(self, event):
         # 1. Handle Autocomplete Key Logic
         if self.completer and self.completer.popup().isVisible():
-            if event.key() in (
-                Qt.Key_Tab,
-            ):
+            if event.key() in (Qt.Key_Tab,):
                 event.ignore()
                 return
 
@@ -488,6 +486,10 @@ class MainWindow(QMainWindow):
         self.program_entry_point = 0
 
         self.app_settings = {"highlight_execution": True}
+
+        self.ignore_breakpoint_once = False 
+
+        self.apply_styles()
 
         self.apply_styles()
         self.setup_ui()
@@ -933,7 +935,7 @@ STOP
         if self.is_code_dirty:
             success = self.load_program()
             if not success:
-                return  # Do not run if build failed
+                return
 
         if self.timer.isActive():
             self.timer.stop()
@@ -945,7 +947,7 @@ STOP
             )
         else:
             if self.emu.is_finished:
-                # If finished, we reset to entry point
+                # Reset if finished
                 self.emu.pc = self.program_entry_point
                 self.emu.is_finished = False
                 self.emu.input_needed = 0
@@ -953,16 +955,13 @@ STOP
                 self.emu.output_buffer = []
                 self.console_out.append(">>> Restarting...")
 
-            # Logic to handle starting ON a breakpoint
+            # --- BREAKPOINT RESUME LOGIC ---
             current_line = self.pc_to_line_map.get(self.emu.pc, -1)
             if current_line in self.editor.breakpoints:
-                self.step_execution()  # Step once to get off breakpoint
-                if (
-                    self.emu.is_finished
-                    or self.emu.input_needed > 0
-                    or not self.is_auto_running
-                ):
-                    return
+                self.ignore_breakpoint_once = True
+            else:
+                self.ignore_breakpoint_once = False
+            # -------------------------------
 
             self.is_auto_running = True
             self.timer.start(self.slider_speed.value())
@@ -1036,8 +1035,6 @@ STOP
         self.lbl_pc.setText(f"PC: {self.emu.pc}")
         self.lbl_cycles.setText(f"CYCLES: {self.cycle_count}")
 
-        self.mem_table.blockSignals(True)
-
         if self.app_settings["highlight_execution"]:
             line_idx = self.pc_to_line_map.get(self.emu.pc, -1)
             self.editor.set_execution_line(line_idx)
@@ -1089,50 +1086,53 @@ STOP
                 f"background-color: {COLORS['input_bg']}; color: {COLORS['fg']};"
             )
 
-        # Table Update
-        registers_list = list(self.emu.registers.items())
-        if self.mem_table.rowCount() != len(registers_list):
-            self.mem_table.setRowCount(len(registers_list))
+        # --- REBUILT MEMORY TABLE LOGIC ---
+        # 1. Gather all addresses to display
+        #    This combines named variables (registers) AND any memory address 
+        #    that has been written to (touched_memory)
+        all_addresses = set(self.emu.registers.values()) | self.emu.touched_memory
+        sorted_addresses = sorted(list(all_addresses))
+        
+        # Map Address -> Name for display
+        addr_to_name = {v: k for k, v in self.emu.registers.items()}
 
-        for row, (name, addr) in enumerate(registers_list):
+        # 2. Rebuild the table entirely
+        self.mem_table.blockSignals(True) # Prevent events while building
+        self.mem_table.setRowCount(len(sorted_addresses))
+
+        for row, addr in enumerate(sorted_addresses):
+            # Retrieve value safely
+            val = 0
             try:
                 if isinstance(self.emu.memory, list):
-                    if 0 <= addr < len(self.emu.memory):
-                        val = self.emu.memory[addr]
-                    else:
-                        val = "ERR"
+                    val = self.emu.memory[addr]
                 else:
                     val = self.emu.memory.get(addr, 0)
-            except Exception:
+            except:
                 val = 0
 
-            if row not in self.table_items_cache:
-                i_name = QTableWidgetItem(name)
-                i_addr = QTableWidgetItem(str(addr))
-                i_val = QTableWidgetItem(str(val))
+            var_name = addr_to_name.get(addr, "")
 
-                i_name.setForeground(QColor(COLORS["orange"]))
-                i_name.setFlags(i_name.flags() & ~Qt.ItemIsEditable)
+            # Create fresh items for this row
+            i_name = QTableWidgetItem(var_name)
+            i_name.setForeground(QColor(COLORS["orange"]))
+            i_name.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable) # Read-only
 
-                i_addr.setTextAlignment(Qt.AlignCenter)
-                i_addr.setFlags(i_addr.flags() & ~Qt.ItemIsEditable)
+            i_addr = QTableWidgetItem(str(addr))
+            i_addr.setTextAlignment(Qt.AlignCenter)
+            i_addr.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable) # Read-only
 
-                i_val.setTextAlignment(Qt.AlignCenter)
-                i_val.setForeground(QColor(COLORS["cyan"]))
-                i_val.setFlags(i_val.flags() | Qt.ItemIsEditable)
+            i_val = QTableWidgetItem(str(val))
+            i_val.setTextAlignment(Qt.AlignCenter)
+            i_val.setForeground(QColor(COLORS["cyan"]))
+            i_val.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
 
-                self.mem_table.setItem(row, 0, i_name)
-                self.mem_table.setItem(row, 1, i_addr)
-                self.mem_table.setItem(row, 2, i_val)
-                self.table_items_cache[row] = (i_name, i_addr, i_val)
-
-            self.table_items_cache[row][0].setText(name)
-            self.table_items_cache[row][1].setText(str(addr))
-
-            if self.table_items_cache[row][2].text() != str(val):
-                self.table_items_cache[row][2].setText(str(val))
+            self.mem_table.setItem(row, 0, i_name)
+            self.mem_table.setItem(row, 1, i_addr)
+            self.mem_table.setItem(row, 2, i_val)
 
         self.mem_table.blockSignals(False)
+        # --- END TABLE LOGIC ---
 
     def handle_input(self):
         text = self.input_field.text()
