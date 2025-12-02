@@ -162,18 +162,22 @@ class PicoEmulator:
 
     def provide_input(self, value):
         """
-        Called by GUI when user enters data into the input field.
+        Called by GUI when user enters data.
+        Updates memory and manages PC advancement.
         """
         if self.input_needed > 0:
             try:
                 val = int(value)
                 self.memory[self.input_dest_addr] = val
-                
-                # CRITICAL: Mark address as touched
                 self.touched_memory.add(self.input_dest_addr)
                 
                 self.input_dest_addr += 1
                 self.input_needed -= 1
+                
+                # FIX: Only advance PC once ALL required inputs are received.
+                if self.input_needed == 0:
+                    self.pc += 1
+                    
                 return True
             except ValueError:
                 return False
@@ -181,6 +185,7 @@ class PicoEmulator:
 
     def step(self):
         """Executes a single instruction."""
+        # If waiting for input, do nothing.
         if self.is_finished or self.input_needed > 0:
             return
 
@@ -192,23 +197,22 @@ class PicoEmulator:
         instr_data = self.instructions[self.pc]
         line = instr_data["text"]
 
-        # Tokenize (split by space or comma)
         parts = re.split(r"[ ,]+", line)
         parts = [p.strip() for p in parts if p.strip()]
 
         opcode = parts[0].upper()
         args = parts[1:]
 
+        # Default behavior: PC moves to next line.
+        # We will override this for specific instructions (Jumps, IN).
         next_pc = self.pc + 1
 
         try:
             if opcode == "MOV":
-                # MOV Dest, Src
                 val = self.resolve_value(args[1])
                 self.set_value(args[0], val)
 
             elif opcode == "ADD":
-                # ADD Dest, Src1, Src2
                 val1 = self.resolve_value(args[1])
                 val2 = self.resolve_value(args[2])
                 self.set_value(args[0], val1 + val2)
@@ -233,24 +237,19 @@ class PicoEmulator:
             elif opcode == "IN":
                 # IN Address, [Count]
                 addr = self.resolve_address(args[0])
-                
-                # Check if count is provided, otherwise default to 1
                 count = 1
                 if len(args) > 1:
-                    # e.g. IN A, LEN (LEN=2 -> count=2)
                     count = self.resolve_value(args[1])
 
                 if count > 0:
                     self.input_needed = count
                     self.input_dest_addr = addr
-                    # Don't increment PC yet, wait for input to finish
-                    self.pc = next_pc 
-                    return
+                    # FIX: Do NOT advance 'next_pc' yet. 
+                    # We stay on this instruction until provide_input() finishes.
+                    return 
 
             elif opcode == "OUT":
-                # OUT Address, [Count]
                 addr = self.resolve_address(args[0])
-                
                 count = 1
                 if len(args) > 1:
                     count = self.resolve_value(args[1])
@@ -262,7 +261,6 @@ class PicoEmulator:
                 self.output_buffer.append(" ".join(line_out))
 
             elif opcode == "BEQ":
-                # BEQ Val1, Val2, Label
                 val1 = self.resolve_value(args[0])
                 val2 = self.resolve_value(args[1])
                 label = args[2].upper()
@@ -273,7 +271,6 @@ class PicoEmulator:
                         raise ValueError(f"Unknown label: {label}")
 
             elif opcode == "BGT":
-                # BGT Val1, Val2, Label
                 val1 = self.resolve_value(args[0])
                 val2 = self.resolve_value(args[1])
                 label = args[2].upper()
@@ -284,10 +281,9 @@ class PicoEmulator:
                         raise ValueError(f"Unknown label: {label}")
 
             elif opcode == "JSR":
-                # JSR Label
                 label = args[0].upper()
                 self.memory[self.sp] = next_pc
-                self.touched_memory.add(self.sp) # Track stack changes
+                self.touched_memory.add(self.sp)
                 self.sp -= 1
                 if label in self.labels:
                     next_pc = self.labels[label]
@@ -304,9 +300,9 @@ class PicoEmulator:
                     val = self.resolve_value(args[0])
                     self.output_buffer.append(f"STOP Result: {val}")
 
-            # Advance Program Counter
+            # Apply the calculated PC
             self.pc = next_pc
 
         except Exception as e:
-            self.last_error = f"Runtime Error on line {instr_data['line_no']}: {str(e)}"
+            self.last_error = f"Error line {instr_data['line_no']}: {str(e)}"
             self.is_finished = True

@@ -935,9 +935,10 @@ STOP
         if self.is_code_dirty:
             success = self.load_program()
             if not success:
-                return
+                return  # Do not run if build failed
 
         if self.timer.isActive():
+            # STOPPING
             self.timer.stop()
             self.is_auto_running = False
             self.act_run.setText("Run")
@@ -946,6 +947,7 @@ STOP
                 f"color: {COLORS['orange']}; font-weight: bold;"
             )
         else:
+            # STARTING
             if self.emu.is_finished:
                 # Reset if finished
                 self.emu.pc = self.program_entry_point
@@ -955,14 +957,17 @@ STOP
                 self.emu.output_buffer = []
                 self.console_out.append(">>> Restarting...")
 
-            # --- BREAKPOINT RESUME LOGIC ---
+            # FIX: Handling starting FROM a breakpoint
             current_line = self.pc_to_line_map.get(self.emu.pc, -1)
             if current_line in self.editor.breakpoints:
-                self.ignore_breakpoint_once = True
-            else:
-                self.ignore_breakpoint_once = False
-            # -------------------------------
-
+                # Step ONCE to move off the breakpoint line
+                self.step_execution()
+                
+                # If that single step finished the program or required input, stop here.
+                if self.emu.is_finished or self.emu.input_needed > 0:
+                    return
+            
+            # Now we are safely off the breakpoint, start the timer
             self.is_auto_running = True
             self.timer.start(self.slider_speed.value())
             self.act_run.setText("Stop")
