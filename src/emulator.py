@@ -227,7 +227,7 @@ class PicoEmulator:
                 elif opcode == "DIV":
                     if val2 == 0:
                         raise ValueError("Division by zero")
-                    res = val1 // val2
+                    res = val1 / val2
 
                 self.set_value(args[0], res)
 
