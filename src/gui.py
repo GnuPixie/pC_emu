@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QSplitter,
     QLineEdit,
+    QCompleter,
     QMessageBox,
     QHeaderView,
     QFileDialog,
@@ -23,15 +24,17 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QDialogButtonBox,
     QFormLayout,
-    QAbstractItemView,
-    QSlider,
-    QSpinBox,
-    QCompleter,
+    QStyle,
     QDockWidget,
     QTreeWidget,
     QTreeWidgetItem,
+    QTabWidget,
+    QStatusBar,
+    QSpacerItem,
+    QSizePolicy,
+    QSpinBox,
 )
-from PySide6.QtCore import Qt, QTimer, QRect, QSize, QPoint, QStringListModel
+from PySide6.QtCore import Qt, QTimer, QRect, QSize, QPoint, QStringListModel, QSettings
 from PySide6.QtGui import (
     QFont,
     QColor,
@@ -44,16 +47,22 @@ from PySide6.QtGui import (
     QBrush,
     QTextCursor,
     QKeySequence,
+    QPixmap,
+    QPen,
+    QPainterPath,
 )
 
+# Assuming emulator.py exists in the same directory
 from emulator import PicoEmulator
 
-# --- COLOR PALETTE (Dracula Inspired) ---
+# --- COLOR PALETTE ---
 COLORS = {
     "bg": "#282a36",
     "fg": "#f8f8f2",
+    "sidebar": "#21222c",
     "current_line": "#44475a",
-    "executing_line": "#005f00",  # Dark Green
+    "executing_line": "#005f00",
+    "error_line": "#6b1818",
     "comment": "#6272a4",
     "cyan": "#8be9fd",
     "green": "#50fa7b",
@@ -64,12 +73,10 @@ COLORS = {
     "yellow": "#f1fa8c",
     "selection": "#44475a",
     "input_bg": "#44475a",
-    "modal_bg": "#343746",
     "breakpoint": "#ff5555",
+    "icon_color": "#8be9fd",  # Cyan for icons
 }
 
-# --- OPCODE REFERENCE DATA ---
-# Removed JMP, CMP, BLT as requested
 OPCODE_REF = [
     ("MOV", "MOV Dest, Src", "Copy value from Src to Dest"),
     ("ADD", "ADD Dest, Src1, Src2", "Dest = Src1 + Src2"),
@@ -87,79 +94,116 @@ OPCODE_REF = [
 ]
 
 
+# --- ICON FACTORY ---
+class IconFactory:
+    @staticmethod
+    def draw_icon(shape, color=COLORS["icon_color"]):
+        pixmap = QPixmap(32, 32)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        pen = QPen(QColor(color))
+        pen.setWidth(2)
+        painter.setPen(pen)
+        painter.setBrush(QColor(color))
+
+        if shape == "play":
+            path = QPainterPath()
+            path.moveTo(8, 6)
+            path.lineTo(26, 16)
+            path.lineTo(8, 26)
+            path.closeSubpath()
+            painter.drawPath(path)
+
+        elif shape == "pause":
+            painter.drawRect(8, 6, 5, 20)
+            painter.drawRect(19, 6, 5, 20)
+
+        elif shape == "step":
+            # Arrow
+            path = QPainterPath()
+            path.moveTo(4, 10)
+            path.lineTo(14, 16)
+            path.lineTo(4, 22)
+            path.closeSubpath()
+            painter.drawPath(path)
+            # Bar
+            painter.drawRect(16, 8, 4, 16)
+
+        elif shape == "reset":
+            # Simple circular arrow
+            painter.setBrush(Qt.NoBrush)
+            pen.setWidth(3)
+            painter.setPen(pen)
+            painter.drawArc(6, 6, 20, 20, 45 * 16, 270 * 16)
+            # Arrow head
+            path = QPainterPath()
+            path.moveTo(20, 4)
+            path.lineTo(26, 10)
+            path.lineTo(28, 2)
+            painter.setBrush(QColor(color))
+            painter.setPen(Qt.NoPen)
+            painter.drawPath(path)
+
+        elif shape == "settings":
+            painter.setBrush(Qt.NoBrush)
+            pen.setWidth(2)
+            painter.setPen(pen)
+            painter.drawEllipse(8, 8, 16, 16)
+            painter.drawPoint(16, 16)  # Center dot
+
+        elif shape == "save":
+            painter.drawRect(6, 6, 20, 20)
+            painter.setBrush(QColor(COLORS["bg"]))
+            painter.drawRect(10, 6, 12, 6)
+
+        elif shape == "open":
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(4, 8, 24, 16)
+            painter.drawLine(4, 8, 10, 2)
+            painter.drawLine(10, 2, 28, 2)
+            painter.drawLine(28, 2, 28, 8)
+
+        painter.end()
+        return QIcon(pixmap)
+
+
 # --- SETTINGS DIALOG ---
 class SettingsDialog(QDialog):
-    def __init__(self, parent=None, settings=None):
+    def __init__(self, parent=None, current_settings=None):
         super().__init__(parent)
         self.setWindowTitle("Preferences")
-        self.resize(300, 150)
-        self.settings = settings if settings else {}
+        self.setFixedWidth(300)
 
+        # Style
         self.setStyleSheet(
             f"""
-            QDialog {{ background-color: {COLORS['modal_bg']}; color: {COLORS['fg']}; }}
-            QLabel {{ color: {COLORS['fg']}; font-size: 14px; }}
-            QCheckBox {{ color: {COLORS['fg']}; spacing: 5px; }}
-            QCheckBox::indicator {{ width: 18px; height: 18px; }}
+            QDialog {{ background: {COLORS['bg']}; color: {COLORS['fg']}; }}
+            QLabel, QCheckBox {{ color: {COLORS['fg']}; font-size: 14px; }}
+            QPushButton {{ background: {COLORS['current_line']}; color: {COLORS['fg']}; border: none; padding: 6px; }}
+            QPushButton:hover {{ background: {COLORS['comment']}; }}
         """
         )
 
         layout = QVBoxLayout(self)
-        form_layout = QFormLayout()
 
-        self.cb_highlight = QCheckBox()
-        self.cb_highlight.setChecked(self.settings.get("highlight_execution", True))
+        self.cb_lock_editor = QCheckBox("Lock Editor while Running")
+        self.cb_lock_editor.setChecked(current_settings.get("lock_editor", True))
 
-        lbl = QLabel("Highlight Executing Line:")
-        form_layout.addRow(lbl, self.cb_highlight)
-
-        layout.addLayout(form_layout)
+        layout.addWidget(self.cb_lock_editor)
         layout.addStretch()
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
 
-    def get_settings(self):
-        return {"highlight_execution": self.cb_highlight.isChecked()}
-
-
-# --- SYNTAX HIGHLIGHTER ---
-class AssemblyHighlighter(QSyntaxHighlighter):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.highlighting_rules = []
-
-        keywords = [x[0] for x in OPCODE_REF]
-        keyword_format = QTextCharFormat()
-        keyword_format.setForeground(QColor(COLORS["pink"]))
-        keyword_format.setFontWeight(QFont.Bold)
-        for word in keywords:
-            pattern = rf"\b{word}\b"
-            self.highlighting_rules.append(
-                (re.compile(pattern, re.IGNORECASE), keyword_format)
-            )
-
-        label_format = QTextCharFormat()
-        label_format.setForeground(QColor(COLORS["green"]))
-        self.highlighting_rules.append((re.compile(r"^[A-Z_0-9]+:"), label_format))
-
-        number_format = QTextCharFormat()
-        number_format.setForeground(QColor(COLORS["purple"]))
-        self.highlighting_rules.append((re.compile(r"\b\d+\b"), number_format))
-
-        comment_format = QTextCharFormat()
-        comment_format.setForeground(QColor(COLORS["comment"]))
-        self.highlighting_rules.append((re.compile(r";.*"), comment_format))
-
-    def highlightBlock(self, text):
-        for pattern, format in self.highlighting_rules:
-            for match in pattern.finditer(text):
-                self.setFormat(match.start(), match.end() - match.start(), format)
+    def get_data(self):
+        return {"lock_editor": self.cb_lock_editor.isChecked()}
 
 
-# --- CUSTOM EDITOR ---
+# --- CUSTOM EDITOR COMPONENTS ---
 class LineNumberArea(QWidget):
     def __init__(self, editor):
         super().__init__(editor)
@@ -174,8 +218,8 @@ class LineNumberArea(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
-            y_pos = event.pos().y()
-            cursor = self.editor.cursorForPosition(QPoint(0, y_pos))
+            # Calculate line number carefully
+            cursor = self.editor.cursorForPosition(event.pos())
             block = cursor.block()
             line_num = block.blockNumber()
             self.editor.toggle_breakpoint(line_num)
@@ -192,15 +236,15 @@ class CodeEditor(QPlainTextEdit):
         self.update_line_number_area_width(0)
 
         self.execution_line_index = -1
+        self.error_line_index = -1
         self.show_execution_highlight = True
         self.breakpoints = set()
 
         font = QFont("Consolas", 12)
         font.setStyleHint(QFont.Monospace)
         self.setFont(font)
-        self.highlight_lines()
 
-        # Autocomplete Setup
+        # Completer
         self.completer = None
         self.setup_completer()
 
@@ -209,17 +253,13 @@ class CodeEditor(QPlainTextEdit):
         self.completer.setWidget(self)
         self.completer.setCompletionMode(QCompleter.PopupCompletion)
         self.completer.setCaseSensitivity(Qt.CaseInsensitive)
-
-        # Build keyword list
-        keywords = [x[0] for x in OPCODE_REF]
-        keywords += ["M", "N", "R", "A", "B", "I", "J"]
+        keywords = [x[0] for x in OPCODE_REF] + ["M", "N", "R", "A", "B", "I", "J"]
         self.completer.setModel(QStringListModel(keywords, self.completer))
         self.completer.activated.connect(self.insert_completion)
 
     def insert_completion(self, completion):
         if self.completer.widget() != self:
             return
-
         tc = self.textCursor()
         extra = len(completion) - len(self.completer.completionPrefix())
         tc.movePosition(QTextCursor.Left)
@@ -238,22 +278,24 @@ class CodeEditor(QPlainTextEdit):
         super().focusInEvent(event)
 
     def keyPressEvent(self, event):
-        # 1. Handle Autocomplete Key Logic
         if self.completer and self.completer.popup().isVisible():
-            if event.key() in (Qt.Key_Tab,):
+            if event.key() in (
+                Qt.Key_Enter,
+                Qt.Key_Return,
+                Qt.Key_Escape,
+                Qt.Key_Tab,
+                Qt.Key_Backtab,
+            ):
                 event.ignore()
                 return
 
-        # 2. Smart Indentation logic
-        if event.key() == Qt.Key_Return or event.key() == Qt.Key_Enter:
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
             cursor = self.textCursor()
             current_line = cursor.block().text()
             indentation = ""
             match = re.match(r"^(\s+)", current_line)
             if match:
                 indentation = match.group(1)
-
-            # Use default handling for the newline, then insert spaces
             super().keyPressEvent(event)
             self.insertPlainText(indentation)
             return
@@ -264,14 +306,12 @@ class CodeEditor(QPlainTextEdit):
         if not self.completer or not is_shortcut:
             super().keyPressEvent(event)
 
-        # 3. Trigger Autocomplete Popup
         ctrl_or_shift = event.modifiers() & (Qt.ControlModifier | Qt.ShiftModifier)
         if not self.completer or (ctrl_or_shift and len(event.text()) == 0):
             return
 
         eow = "~!@#$%^&*()_+{}|:\"<>?,./;'[]\\-="
         has_modifier = (event.modifiers() != Qt.NoModifier) and not ctrl_or_shift
-
         completion_prefix = self.text_under_cursor()
 
         if not is_shortcut and (
@@ -298,8 +338,9 @@ class CodeEditor(QPlainTextEdit):
 
     def line_number_area_width(self):
         digits = len(str(max(1, self.blockCount())))
-        space = 3 + self.fontMetrics().horizontalAdvance("9") * digits
-        return space + 20
+        # Width: Margin(5) + Dot(10) + Margin(5) + Text + Margin(5)
+        space = 25 + self.fontMetrics().horizontalAdvance("9") * digits
+        return space
 
     def update_line_number_area_width(self, _):
         self.setViewportMargins(self.line_number_area_width(), 0, 0, 0)
@@ -330,6 +371,17 @@ class CodeEditor(QPlainTextEdit):
 
     def set_execution_line(self, line_idx):
         self.execution_line_index = line_idx
+        self.error_line_index = -1
+        self.highlight_lines()
+        if line_idx >= 0:
+            block = self.document().findBlockByNumber(line_idx)
+            cursor = self.textCursor()
+            cursor.setPosition(block.position())
+            self.ensureCursorVisible()
+
+    def set_error_line(self, line_idx):
+        self.error_line_index = line_idx
+        self.execution_line_index = -1
         self.highlight_lines()
         if line_idx >= 0:
             block = self.document().findBlockByNumber(line_idx)
@@ -341,8 +393,7 @@ class CodeEditor(QPlainTextEdit):
         extra_selections = []
         if not self.isReadOnly():
             selection = QTextEdit.ExtraSelection()
-            line_color = QColor(COLORS["current_line"])
-            selection.format.setBackground(line_color)
+            selection.format.setBackground(QColor(COLORS["current_line"]))
             selection.format.setProperty(QTextFormat.FullWidthSelection, True)
             selection.cursor = self.textCursor()
             selection.cursor.clearSelection()
@@ -350,117 +401,130 @@ class CodeEditor(QPlainTextEdit):
 
             if self.show_execution_highlight and self.execution_line_index >= 0:
                 exec_selection = QTextEdit.ExtraSelection()
-                exec_color = QColor(COLORS["executing_line"])
-                exec_selection.format.setBackground(exec_color)
+                exec_selection.format.setBackground(QColor(COLORS["executing_line"]))
                 exec_selection.format.setProperty(QTextFormat.FullWidthSelection, True)
-
                 block = self.document().findBlockByNumber(self.execution_line_index)
                 cursor = self.textCursor()
                 cursor.setPosition(block.position())
-
                 exec_selection.cursor = cursor
                 exec_selection.cursor.clearSelection()
                 extra_selections.append(exec_selection)
+
+            if self.error_line_index >= 0:
+                err_selection = QTextEdit.ExtraSelection()
+                err_selection.format.setBackground(QColor(COLORS["error_line"]))
+                err_selection.format.setProperty(QTextFormat.FullWidthSelection, True)
+                block = self.document().findBlockByNumber(self.error_line_index)
+                cursor = self.textCursor()
+                cursor.setPosition(block.position())
+                err_selection.cursor = cursor
+                err_selection.cursor.clearSelection()
+                extra_selections.append(err_selection)
 
         self.setExtraSelections(extra_selections)
 
     def lineNumberAreaPaintEvent(self, event):
         painter = QPainter(self.line_number_area)
-        painter.fillRect(event.rect(), QColor("#21222c"))
+        painter.fillRect(event.rect(), QColor(COLORS["sidebar"]))
 
         block = self.firstVisibleBlock()
         block_number = block.blockNumber()
         top = self.blockBoundingGeometry(block).translated(self.contentOffset()).top()
         bottom = top + self.blockBoundingRect(block).height()
-
         height = self.fontMetrics().height()
 
         while block.isValid() and top <= event.rect().bottom():
             if block.isVisible() and bottom >= event.rect().top():
                 number = str(block_number + 1)
-                painter.setPen(QColor(COLORS["comment"]))
 
+                # Draw Breakpoint (Circle on the Left)
                 if block_number in self.breakpoints:
                     painter.setBrush(QBrush(QColor(COLORS["breakpoint"])))
                     painter.setPen(Qt.NoPen)
-                    radius = height / 3
-                    cy = top + height / 2 - 2
-                    cx = 8
+                    radius = 4
+                    cy = top + height / 2
+                    cx = 8  # Left margin
                     painter.drawEllipse(QPoint(int(cx), int(cy)), radius, radius)
-                    painter.setPen(QColor(COLORS["fg"]))
 
+                # Set Text Color
+                painter.setPen(QColor(COLORS["comment"]))
+
+                # Draw Execution Arrow (Triangle near numbers)
                 if (
                     block_number == self.execution_line_index
                     and self.show_execution_highlight
                 ):
                     painter.setPen(QColor(COLORS["green"]))
                     painter.setFont(QFont("Consolas", 10, QFont.Bold))
+                    painter.drawText(
+                        0,
+                        int(top),
+                        self.line_number_area.width() - 5,
+                        height,
+                        Qt.AlignRight,
+                        "►",
+                    )
+
+                elif block_number == self.error_line_index:
+                    painter.setPen(QColor(COLORS["red"]))
+                    painter.setFont(QFont("Consolas", 10, QFont.Bold))
+                    painter.drawText(
+                        0,
+                        int(top),
+                        self.line_number_area.width() - 5,
+                        height,
+                        Qt.AlignRight,
+                        "!",
+                    )
+
                 else:
                     painter.setFont(QFont("Consolas", 10))
+                    # Draw text shifted right to avoid breakpoint collision
+                    painter.drawText(
+                        0,
+                        int(top),
+                        self.line_number_area.width() - 5,
+                        height,
+                        Qt.AlignRight,
+                        number,
+                    )
 
-                painter.drawText(
-                    0,
-                    int(top),
-                    self.line_number_area.width() - 5,
-                    height,
-                    Qt.AlignRight,
-                    number,
-                )
             block = block.next()
             top = bottom
             bottom = top + self.blockBoundingRect(block).height()
             block_number += 1
 
 
-# --- REFERENCE DOCK WIDGET ---
-class ReferenceDock(QDockWidget):
-    def __init__(self, parent=None, editor=None):
-        super().__init__("Instruction Set", parent)
-        self.editor = editor
-        self.setAllowedAreas(Qt.RightDockWidgetArea | Qt.LeftDockWidgetArea)
+class AssemblyHighlighter(QSyntaxHighlighter):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.rules = []
+        kw_fmt = QTextCharFormat()
+        kw_fmt.setForeground(QColor(COLORS["pink"]))
+        kw_fmt.setFontWeight(QFont.Bold)
+        for w in [x[0] for x in OPCODE_REF]:
+            self.rules.append((re.compile(rf"\b{w}\b", re.IGNORECASE), kw_fmt))
+        lbl_fmt = QTextCharFormat()
+        lbl_fmt.setForeground(QColor(COLORS["green"]))
+        self.rules.append((re.compile(r"^[A-Z_0-9]+:"), lbl_fmt))
+        num_fmt = QTextCharFormat()
+        num_fmt.setForeground(QColor(COLORS["purple"]))
+        self.rules.append((re.compile(r"\b\d+\b"), num_fmt))
+        cmt_fmt = QTextCharFormat()
+        cmt_fmt.setForeground(QColor(COLORS["comment"]))
+        self.rules.append((re.compile(r";.*"), cmt_fmt))
 
-        # Create Tree Widget
-        self.tree = QTreeWidget()
-        self.tree.setColumnCount(2)
-        self.tree.setHeaderLabels(["Opcode", "Description"])
-        self.tree.setColumnWidth(0, 70)
-        self.tree.setStyleSheet(
-            f"""
-            QTreeWidget {{
-                background-color: {COLORS['bg']};
-                color: {COLORS['fg']};
-                border: none;
-            }}
-            QHeaderView::section {{
-                background-color: {COLORS['current_line']};
-                color: {COLORS['cyan']};
-                padding: 4px;
-            }}
-            QTreeWidget::item:hover {{ background-color: {COLORS['current_line']}; }}
-            QTreeWidget::item:selected {{ background-color: {COLORS['selection']}; }}
-        """
-        )
+    def highlightBlock(self, text):
+        for pat, fmt in self.rules:
+            for m in pat.finditer(text):
+                self.setFormat(m.start(), m.end() - m.start(), fmt)
 
-        for op, syntax, desc in OPCODE_REF:
-            item = QTreeWidgetItem([op, desc])
-            # Store syntax in data for tooltip or insertion
-            item.setData(0, Qt.UserRole, syntax)
-            item.setToolTip(0, syntax)
-            item.setToolTip(1, desc)
-            # Color styling
-            item.setForeground(0, QBrush(QColor(COLORS["pink"])))
-            self.tree.addTopLevelItem(item)
 
-        self.tree.itemDoubleClicked.connect(self.insert_instruction)
-        self.setWidget(self.tree)
+class QCompleter(sys.modules[__name__].QCompleter):
+    pass
 
-    def insert_instruction(self, item, column):
-        if not self.editor:
-            return
-        # Insert the Opcode text
-        opcode = item.text(0)
-        self.editor.insertPlainText(opcode + " ")
-        self.editor.setFocus()
+
+from PySide6.QtWidgets import QCompleter
 
 
 # --- MAIN WINDOW ---
@@ -468,330 +532,620 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PicoComputer IDE")
-        self.resize(1300, 800)
-        self.setWindowIcon(QIcon.fromTheme("system-run"))
+        self.resize(1300, 850)
 
         self.emu = PicoEmulator()
         self.timer = QTimer()
         self.timer.timeout.connect(self.step_execution)
 
         self.current_file_path = None
-        self.table_items_cache = {}
         self.pc_to_line_map = {}
-        self.is_auto_running = False
-        self.cycle_count = 0
-
-        # Tracking "Dirty" state to ensure we always run latest code
         self.is_code_dirty = True
         self.program_entry_point = 0
+        self.cycle_count = 0
+        self.was_running_before_input = False
 
-        self.app_settings = {"highlight_execution": True}
+        self.settings = {"lock_editor": True}
 
-        self.ignore_breakpoint_once = False
-
-        self.apply_styles()
-
-        self.apply_styles()
         self.setup_ui()
+        self.apply_theme()
         self.load_default_code()
 
-        # Connect editor change to dirty flag
-        self.editor.textChanged.connect(self.on_code_changed)
-
-    def apply_styles(self):
-        qss = f"""
-            QMainWindow {{ background-color: {COLORS['bg']}; color: {COLORS['fg']}; }}
-            QWidget {{ color: {COLORS['fg']}; font-family: 'Segoe UI', sans-serif; font-size: 14px; }}
+    def apply_theme(self):
+        self.setStyleSheet(
+            f"""
+            QMainWindow, QDockWidget {{ background-color: {COLORS['bg']}; color: {COLORS['fg']}; }}
+            QWidget {{ font-family: 'Segoe UI', sans-serif; font-size: 13px; color: {COLORS['fg']}; }}
             
-            QPlainTextEdit, QTextEdit {{ 
+            QPlainTextEdit, QTextEdit, QTreeWidget, QTableWidget {{ 
                 background-color: {COLORS['bg']}; 
                 color: {COLORS['fg']}; 
                 border: none;
+                font-family: 'Consolas', monospace;
             }}
             
             QTableWidget {{ 
-                background-color: {COLORS['bg']}; 
                 gridline-color: {COLORS['current_line']};
-                border: 1px solid {COLORS['current_line']};
                 selection-background-color: {COLORS['selection']};
-                color: {COLORS['fg']};
             }}
             QHeaderView::section {{
-                background-color: {COLORS['current_line']};
+                background-color: {COLORS['sidebar']};
                 color: {COLORS['cyan']};
-                padding: 4px;
-                border: 1px solid {COLORS['bg']};
+                padding: 5px;
+                border: none;
+                font-weight: bold;
+            }}
+            
+            QTabWidget::pane {{ border: 1px solid {COLORS['current_line']}; }}
+            QTabBar::tab {{
+                background: {COLORS['sidebar']};
+                color: {COLORS['comment']};
+                padding: 8px 15px;
+            }}
+            QTabBar::tab:selected {{
+                background: {COLORS['bg']};
+                color: {COLORS['fg']};
+                border-bottom: 2px solid {COLORS['pink']};
             }}
             
             QLineEdit, QSpinBox {{ 
                 background-color: {COLORS['input_bg']}; 
                 border: 1px solid {COLORS['comment']}; 
-                border-radius: 4px; 
-                padding: 5px; 
-                color: {COLORS['fg']};
+                border-radius: 4px; padding: 4px; color: {COLORS['fg']};
             }}
             
-            QSlider::groove:horizontal {{
-                border: 1px solid {COLORS['current_line']};
-                height: 8px;
-                background: {COLORS['bg']};
-                margin: 2px 0;
-                border-radius: 4px;
-            }}
-            QSlider::handle:horizontal {{
-                background: {COLORS['cyan']};
-                border: 1px solid {COLORS['cyan']};
-                width: 18px;
-                height: 18px;
-                margin: -6px 0;
-                border-radius: 9px;
-            }}
+            QToolBar {{ background: {COLORS['sidebar']}; border-bottom: 1px solid {COLORS['current_line']}; spacing: 10px; padding: 5px; }}
+            QToolButton {{ background: transparent; border-radius: 4px; padding: 5px; }}
+            QToolButton:hover {{ background: {COLORS['current_line']}; }}
             
-            QPushButton {{
-                background-color: {COLORS['current_line']};
-                color: {COLORS['cyan']};
-                border: 1px solid {COLORS['comment']};
-                border-radius: 4px; 
-                padding: 8px 16px;
-                font-weight: bold;
-            }}
-            QPushButton:hover {{ background-color: {COLORS['comment']}; }}
-            QPushButton:pressed {{ background-color: {COLORS['cyan']}; color: {COLORS['bg']}; }}
-            QPushButton:disabled {{ color: {COLORS['comment']}; border-color: #333; }}
-            
-            QSplitter::handle {{ background-color: {COLORS['current_line']}; }}
-            
-            QDockWidget {{
-                titlebar-close-icon: url(close.png);
-                titlebar-normal-icon: url(undock.png);
-            }}
-            QDockWidget::title {{
-                text-align: left;
-                background: {COLORS['current_line']};
-                padding-left: 5px;
-            }}
+            QStatusBar {{ background: {COLORS['sidebar']}; color: {COLORS['comment']}; }}
         """
-        self.setStyleSheet(qss)
+        )
 
     def setup_ui(self):
-        toolbar = QToolBar("Main Toolbar")
-        toolbar.setMovable(False)
-        self.addToolBar(toolbar)
-
-        open_act = QAction("Open", self)
-        open_act.triggered.connect(self.open_file)
-        toolbar.addAction(open_act)
-
-        save_act = QAction("Save", self)
-        save_act.triggered.connect(self.save_file)
-        toolbar.addAction(save_act)
-
-        toolbar.addSeparator()
-
-        settings_act = QAction("Settings", self)
-        settings_act.triggered.connect(self.open_settings)
-        toolbar.addAction(settings_act)
-
-        toolbar.addSeparator()
-
-        self.act_load = QAction("Build/Load", self)
-        self.act_load.triggered.connect(self.load_program)
-        toolbar.addAction(self.act_load)
-
-        self.act_run = QAction("Run", self)
-        self.act_run.setShortcut("F5")
-        self.act_run.triggered.connect(self.toggle_run)
-        # We start enabled so user can click run to auto-build
-        self.act_run.setEnabled(True)
-        toolbar.addAction(self.act_run)
-
-        self.act_step = QAction("Step", self)
-        self.act_step.setShortcut("F10")
-        self.act_step.triggered.connect(self.manual_step)
-        self.act_step.setEnabled(False)  # Step needs valid build first
-        toolbar.addAction(self.act_step)
-
-        # --- SPEED CONTROLS START ---
-        toolbar.addSeparator()
-
-        lbl_speed = QLabel(" Delay (ms): ")
-        lbl_speed.setStyleSheet(f"color: {COLORS['fg']}")
-        toolbar.addWidget(lbl_speed)
-
-        self.slider_speed = QSlider(Qt.Horizontal)
-        self.slider_speed.setRange(10, 1000)
-        self.slider_speed.setValue(100)
-        self.slider_speed.setFixedWidth(100)
-        self.slider_speed.valueChanged.connect(self.change_speed_from_slider)
-        toolbar.addWidget(self.slider_speed)
-
-        self.spin_speed = QSpinBox()
-        self.spin_speed.setRange(10, 1000)
-        self.spin_speed.setValue(100)
-        self.spin_speed.setFixedWidth(60)
-        self.spin_speed.valueChanged.connect(self.change_speed_from_spin)
-        toolbar.addWidget(self.spin_speed)
-        # --- SPEED CONTROLS END ---
-
-        toolbar.addSeparator()
-
-        # Hard Reset (The only Reset now)
-        reset_act = QAction("Reset", self)
-        reset_act.setToolTip("Restart program from entry point")
-        reset_act.triggered.connect(self.reset_program)
-        toolbar.addAction(reset_act)
-
-        # View Toggle for Dock
-        toolbar.addSeparator()
-        self.view_dock_act = QAction("Ref", self)
-        self.view_dock_act.setCheckable(True)
-        self.view_dock_act.setChecked(True)
-        self.view_dock_act.triggered.connect(self.toggle_dock)
-        toolbar.addAction(self.view_dock_act)
-
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        main_layout = QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(10, 10, 10, 10)
-
-        splitter = QSplitter(Qt.Horizontal)
-
-        left_container = QWidget()
-        left_layout = QVBoxLayout(left_container)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-
-        lbl_code = QLabel("ASSEMBLY SOURCE")
-        lbl_code.setStyleSheet(
-            f"color: {COLORS['orange']}; font-weight: bold; letter-spacing: 1px;"
-        )
-        left_layout.addWidget(lbl_code)
-
         self.editor = CodeEditor()
         self.highlighter = AssemblyHighlighter(self.editor.document())
-        left_layout.addWidget(self.editor)
+        self.editor.textChanged.connect(self.on_code_changed)
+        self.setCentralWidget(self.editor)
 
-        right_container = QWidget()
-        right_layout = QVBoxLayout(right_container)
-        right_layout.setContentsMargins(0, 0, 0, 0)
+        self.setup_toolbar()
+        self.setup_docks()
 
-        status_frame = QFrame()
-        status_frame.setStyleSheet(
-            f"background-color: {COLORS['current_line']}; border-radius: 5px;"
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+
+        self.lbl_status = QLabel(" READY ")
+        self.lbl_status.setStyleSheet(
+            f"background-color: {COLORS['green']}; color: #282a36; font-weight: bold; border-radius: 4px; padding: 2px 5px;"
         )
-        status_layout = QHBoxLayout(status_frame)
 
-        self.lbl_status = QLabel("IDLE")
-        self.lbl_status.setStyleSheet(f"color: {COLORS['pink']}; font-weight: bold;")
+        self.lbl_pc = QLabel(" PC: 000 ")
+        self.lbl_pc.setStyleSheet(
+            f"color: {COLORS['cyan']}; font-family: Consolas; font-weight: bold;"
+        )
 
-        self.lbl_cycles = QLabel("CYCLES: 0")
+        self.lbl_cycles = QLabel(" CYCLES: 0 ")
         self.lbl_cycles.setStyleSheet(
             f"color: {COLORS['yellow']}; font-family: Consolas;"
         )
 
-        self.lbl_pc = QLabel("PC: 000")
-        self.lbl_pc.setStyleSheet(f"color: {COLORS['cyan']}; font-family: Consolas;")
+        self.status_bar.addWidget(QLabel("  State: "))
+        self.status_bar.addWidget(self.lbl_status)
+        self.status_bar.addWidget(QLabel("  "))
+        self.status_bar.addWidget(self.lbl_pc)
+        self.status_bar.addWidget(self.lbl_cycles)
 
-        status_layout.addWidget(QLabel("STATUS:"))
-        status_layout.addWidget(self.lbl_status)
-        status_layout.addStretch()
-        status_layout.addWidget(self.lbl_cycles)
-        status_layout.addSpacing(20)
-        status_layout.addWidget(self.lbl_pc)
-        right_layout.addWidget(status_frame)
+    def setup_toolbar(self):
+        tb = QToolBar("Main Toolbar")
+        tb.setMovable(False)
+        tb.setIconSize(QSize(24, 24))
+        self.addToolBar(tb)
 
-        # Memory Table Configuration
-        right_layout.addWidget(QLabel("MEMORY WATCH (Double-click Value to Edit)"))
-        self.mem_table = QTableWidget()
-        self.mem_table.setColumnCount(3)
-        self.mem_table.setHorizontalHeaderLabels(["VAR", "ADDR", "VAL"])
-        self.mem_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.mem_table.verticalHeader().setVisible(False)
-        self.mem_table.setShowGrid(False)
-        self.mem_table.setAlternatingRowColors(True)
-        self.mem_table.setStyleSheet(f"alternate-background-color: #2e303e;")
+        # File
+        act_open = QAction(IconFactory.draw_icon("open"), "Open", self)
+        act_open.triggered.connect(self.open_file)
+        tb.addAction(act_open)
 
-        self.mem_table.itemChanged.connect(self.handle_memory_edit)
+        act_save = QAction(IconFactory.draw_icon("save"), "Save", self)
+        act_save.triggered.connect(self.save_file)
+        tb.addAction(act_save)
 
-        right_layout.addWidget(self.mem_table)
+        tb.addSeparator()
 
-        right_layout.addWidget(QLabel("TERMINAL OUTPUT"))
+        # Execution
+        self.act_run = QAction(
+            IconFactory.draw_icon("play", COLORS["green"]), "Run", self
+        )
+        self.act_run.setShortcut("F5")
+        self.act_run.triggered.connect(self.toggle_run)
+        self.act_run.setToolTip("Run / Pause (F5)")
+        tb.addAction(self.act_run)
+
+        self.act_step = QAction(
+            IconFactory.draw_icon("step", COLORS["cyan"]), "Step", self
+        )
+        self.act_step.setShortcut("F10")
+        self.act_step.triggered.connect(self.manual_step)
+        self.act_step.setToolTip("Step One Instruction (F10)")
+        tb.addAction(self.act_step)
+
+        act_reset = QAction(
+            IconFactory.draw_icon("reset", COLORS["orange"]), "Reset", self
+        )
+        act_reset.setShortcut("Ctrl+R")
+        act_reset.triggered.connect(self.reset_program)
+        act_reset.setToolTip("Reset Program")
+        tb.addAction(act_reset)
+
+        tb.addSeparator()
+
+        # Settings
+        act_settings = QAction(
+            IconFactory.draw_icon("settings", COLORS["fg"]), "Settings", self
+        )
+        act_settings.triggered.connect(self.open_settings)
+        tb.addAction(act_settings)
+
+        tb.addSeparator()
+
+        # Speed
+        tb.addWidget(QLabel("  Delay (ms): "))
+        self.spin_speed = QSpinBox()
+        self.spin_speed.setRange(10, 2000)
+        self.spin_speed.setValue(100)
+        self.spin_speed.setSingleStep(50)
+        self.spin_speed.setFixedWidth(70)
+        self.spin_speed.valueChanged.connect(self.update_timer_interval)
+        tb.addWidget(self.spin_speed)
+
+    def setup_docks(self):
+        # --- RIGHT DOCK: UNIFIED INSPECTOR ---
+        self.dock_inspector = QDockWidget("Memory Inspector", self)
+        self.dock_inspector.setAllowedAreas(Qt.RightDockWidgetArea)
+
+        self.table_mem = QTableWidget(0, 3)
+        self.table_mem.setHorizontalHeaderLabels(["Addr", "Name", "Value"])
+        self.table_mem.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table_mem.verticalHeader().setVisible(False)
+        self.table_mem.itemChanged.connect(self.handle_memory_edit)
+
+        self.dock_inspector.setWidget(self.table_mem)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.dock_inspector)
+
+        # --- BOTTOM DOCK: TERMINAL & REF ---
+        self.dock_bottom = QDockWidget("Output & Tools", self)
+        self.dock_bottom.setAllowedAreas(Qt.BottomDockWidgetArea)
+
+        bottom_tabs = QTabWidget()
+
+        # Tab 1: Terminal
+        term_widget = QWidget()
+        term_layout = QVBoxLayout(term_widget)
+        term_layout.setContentsMargins(5, 5, 5, 5)
         self.console_out = QTextEdit()
         self.console_out.setReadOnly(True)
-        self.console_out.setFont(QFont("Consolas", 10))
-        self.console_out.setStyleSheet(
-            f"background-color: #1e1e1e; color: {COLORS['green']}; border: 1px solid #333;"
-        )
-        self.console_out.setMaximumHeight(150)
-        right_layout.addWidget(self.console_out)
+        term_layout.addWidget(self.console_out)
 
-        self.input_container = QWidget()
-        inp_layout = QHBoxLayout(self.input_container)
-        inp_layout.setContentsMargins(0, 5, 0, 0)
-
-        lbl_in = QLabel("INPUT >")
-        lbl_in.setStyleSheet(f"color: {COLORS['yellow']}; font-weight: bold;")
+        inp_layout = QHBoxLayout()
+        self.lbl_prompt = QLabel("Input >")
         self.input_field = QLineEdit()
-        self.input_field.setPlaceholderText("Waiting for IN command...")
-        self.input_field.returnPressed.connect(self.handle_input)
+        self.input_field.setPlaceholderText("Program is not asking for input...")
         self.input_field.setEnabled(False)
+        self.input_field.returnPressed.connect(self.handle_input)
 
-        inp_layout.addWidget(lbl_in)
+        inp_layout.addWidget(self.lbl_prompt)
         inp_layout.addWidget(self.input_field)
-        right_layout.addWidget(self.input_container)
+        term_layout.addLayout(inp_layout)
 
-        splitter.addWidget(left_container)
-        splitter.addWidget(right_container)
-        splitter.setSizes([700, 400])
-        main_layout.addWidget(splitter)
+        bottom_tabs.addTab(term_widget, "Terminal")
 
-        # --- REFERENCE DOCK ---
-        self.dock = ReferenceDock(self, self.editor)
-        self.addDockWidget(Qt.RightDockWidgetArea, self.dock)
+        # Tab 2: Reference
+        self.tree_ref = QTreeWidget()
+        self.tree_ref.setHeaderLabels(["Opcode", "Syntax", "Description"])
+        self.tree_ref.setColumnWidth(0, 60)
+        self.tree_ref.setColumnWidth(1, 150)
+        for op, syn, desc in OPCODE_REF:
+            item = QTreeWidgetItem([op, syn, desc])
+            item.setForeground(0, QBrush(QColor(COLORS["pink"])))
+            item.setForeground(1, QBrush(QColor(COLORS["cyan"])))
+            self.tree_ref.addTopLevelItem(item)
+        self.tree_ref.itemDoubleClicked.connect(self.insert_instruction)
+        bottom_tabs.addTab(self.tree_ref, "Reference")
 
-    # --- DOCK LOGIC ---
-    def toggle_dock(self):
-        if self.dock.isVisible():
-            self.dock.close()
-        else:
-            self.dock.show()
+        # Tab 3: Issues
+        self.list_issues = QTextEdit()
+        self.list_issues.setReadOnly(True)
+        self.list_issues.setStyleSheet(f"color: {COLORS['red']};")
+        bottom_tabs.addTab(self.list_issues, "Issues")
 
-    # --- SPEED CONTROL LOGIC ---
-    def change_speed_from_slider(self, value):
-        self.spin_speed.blockSignals(True)
-        self.spin_speed.setValue(value)
-        self.spin_speed.blockSignals(False)
-        self.update_timer_interval(value)
+        self.dock_bottom.setWidget(bottom_tabs)
+        self.addDockWidget(Qt.BottomDockWidgetArea, self.dock_bottom)
+        self.resizeDocks([self.dock_bottom], [200], Qt.Vertical)
 
-    def change_speed_from_spin(self, value):
-        self.slider_speed.blockSignals(True)
-        self.slider_speed.setValue(value)
-        self.slider_speed.blockSignals(False)
-        self.update_timer_interval(value)
+    def open_settings(self):
+        dlg = SettingsDialog(self, self.settings)
+        if dlg.exec():
+            self.settings = dlg.get_data()
+
+    def insert_instruction(self, item, col):
+        text = item.text(0) + " "
+        self.editor.insertPlainText(text)
+        self.editor.setFocus()
 
     def update_timer_interval(self, value):
         if self.timer.isActive():
             self.timer.setInterval(value)
 
-    # --- LOGIC ---
-    def open_settings(self):
-        dlg = SettingsDialog(self, self.app_settings)
-        if dlg.exec():
-            self.app_settings = dlg.get_settings()
-            self.editor.show_execution_highlight = self.app_settings[
-                "highlight_execution"
-            ]
-            self.editor.highlight_lines()
-
     def on_code_changed(self):
         self.is_code_dirty = True
-        self.lbl_status.setText("MODIFIED")
-        self.lbl_status.setStyleSheet(f"color: {COLORS['orange']}; font-weight: bold;")
-        # We don't disable Run, because Run will now auto-build.
-        # We disable Step because stepping on dirty code is confusing.
+        self.lbl_status.setText(" MODIFIED ")
+        self.lbl_status.setStyleSheet(
+            f"background-color: {COLORS['orange']}; color: #282a36; font-weight: bold; border-radius: 4px;"
+        )
         self.act_step.setEnabled(False)
 
+    def load_program(self):
+        code = self.editor.toPlainText()
+        try:
+            self.emu.parse(code)
+            self.build_sourcemap(code)
+            self.program_entry_point = self.emu.pc
+
+            self.list_issues.clear()
+            self.list_issues.append("No issues found.")
+            self.console_out.append(
+                f"<span style='color:{COLORS['green']}'>Build Successful. Entry Point: {self.program_entry_point}</span>"
+            )
+
+            self.act_step.setEnabled(True)
+            self.lbl_status.setText(" READY ")
+            self.lbl_status.setStyleSheet(
+                f"background-color: {COLORS['green']}; color: #282a36; font-weight: bold; border-radius: 4px;"
+            )
+
+            self.editor.set_execution_line(-1)
+            self.is_code_dirty = False
+            self.cycle_count = 0
+            self.was_running_before_input = False
+            self.update_ui()
+            return True
+
+        except Exception as e:
+            self.lbl_status.setText(" ERROR ")
+            self.lbl_status.setStyleSheet(
+                f"background-color: {COLORS['red']}; color: white; font-weight: bold; border-radius: 4px;"
+            )
+            self.list_issues.clear()
+            self.list_issues.append(str(e))
+            self.console_out.append(
+                f"<span style='color:{COLORS['red']}'>Build Failed. Check 'Issues' tab.</span>"
+            )
+
+            match = re.search(r"line\s+(\d+)", str(e), re.IGNORECASE)
+            if match:
+                line_no = int(match.group(1)) - 1
+                self.editor.set_error_line(line_no)
+            self.dock_bottom.widget().setCurrentIndex(2)
+            return False
+
+    def build_sourcemap(self, code_text):
+        self.pc_to_line_map = {}
+        lines = code_text.split("\n")
+        current_address = 0
+
+        def analyze_line(line):
+            line = line.split(";")[0].strip()
+            if not line or line.endswith(":"):
+                return None
+            if "=" in line:
+                return None
+            parts = line.split()
+            if not parts:
+                return None
+            if parts[0].upper() == "ORG" and len(parts) > 1:
+                try:
+                    return ("ORG", int(parts[1]))
+                except:
+                    return None
+            return ("INS", 0)
+
+        for i, line in enumerate(lines):
+            res = analyze_line(line)
+            if res:
+                if res[0] == "ORG":
+                    current_address = res[1]
+                else:
+                    self.pc_to_line_map[current_address] = i
+                    current_address += 1
+
+    def toggle_run(self):
+        # Build if dirty
+        if self.is_code_dirty:
+            if not self.load_program():
+                return
+
+        if self.timer.isActive():
+            # PAUSE
+            self.timer.stop()
+            self.was_running_before_input = False
+        else:
+            # RUN
+            if self.emu.is_finished:
+                self.reset_program()
+
+            # If input is needed, we can't really "run", but we set state
+            if self.emu.input_needed > 0:
+                self.was_running_before_input = True  # Wants to run, but waiting
+                self.update_ui()
+                return
+
+            # Breakpoint handling
+            curr_line = self.pc_to_line_map.get(self.emu.pc, -1)
+            if curr_line in self.editor.breakpoints:
+                self.step_execution()  # Step over
+                if self.emu.is_finished or self.emu.input_needed:
+                    return
+
+            self.timer.start(self.spin_speed.value())
+
+        self.update_ui()
+
+    def manual_step(self):
+        if self.is_code_dirty:
+            if not self.load_program():
+                return
+        self.timer.stop()
+        self.step_execution()
+        self.update_ui()
+
+    def step_execution(self):
+        curr_line = self.pc_to_line_map.get(self.emu.pc, -1)
+        if self.timer.isActive() and curr_line in self.editor.breakpoints:
+            self.timer.stop()
+            self.was_running_before_input = False
+            self.lbl_status.setText(" BREAKPOINT ")
+            self.lbl_status.setStyleSheet(
+                f"background-color: {COLORS['red']}; color: white; font-weight: bold; border-radius: 4px;"
+            )
+            self.editor.set_execution_line(curr_line)
+            self.update_ui()  # Ensure button state updates
+            return
+
+        if self.emu.is_finished or self.emu.input_needed > 0:
+            self.update_ui()
+            return
+
+        try:
+            self.emu.step()
+            self.cycle_count += 1
+            # Don't call update_ui here every ms if running fast?
+            # For now, it's fine.
+            self.update_ui()
+        except Exception as e:
+            self.timer.stop()
+            self.lbl_status.setText(" CRASH ")
+            self.console_out.append(
+                f"<span style='color:red'>Runtime Error: {e}</span>"
+            )
+            self.update_ui()
+
+    def reset_program(self):
+        self.timer.stop()
+        self.was_running_before_input = False
+        if self.load_program():
+            self.emu.pc = self.program_entry_point
+            self.cycle_count = 0
+            self.update_ui()
+
+    def update_ui(self):
+        # 1. Update Labels
+        self.lbl_pc.setText(f" PC: {self.emu.pc} ")
+        self.lbl_cycles.setText(f" CYCLES: {self.cycle_count} ")
+
+        # 2. Highlight Editor
+        line_idx = self.pc_to_line_map.get(self.emu.pc, -1)
+        self.editor.set_execution_line(line_idx)
+
+        # 3. Handle Editor Locking
+        if self.settings.get("lock_editor"):
+            is_running = self.timer.isActive()
+            # If strictly running, lock it.
+            # If paused on breakpoint or waiting for input, conceptually it is "running" the program session.
+            # But usually we allow editing if paused.
+            # Let's lock if timer is active OR waiting for input?
+            should_lock = self.timer.isActive() or (
+                self.was_running_before_input and self.emu.input_needed > 0
+            )
+            self.editor.setReadOnly(should_lock)
+        else:
+            self.editor.setReadOnly(False)
+
+        # 4. Console Output
+        if self.emu.output_buffer:
+            for line in self.emu.output_buffer:
+                self.console_out.append(
+                    f"<span style='color:{COLORS['cyan']}'>OUT &gt; {line}</span>"
+                )
+            self.emu.output_buffer = []
+
+        # 5. Determine State & Icons
+        if self.emu.is_finished:
+            self.timer.stop()
+            self.act_run.setIcon(IconFactory.draw_icon("play", COLORS["green"]))
+            self.act_run.setText("Run")
+            self.lbl_status.setText(" FINISHED ")
+            self.lbl_status.setStyleSheet(
+                f"background-color: {COLORS['cyan']}; color: #282a36; font-weight: bold; border-radius: 4px;"
+            )
+
+        elif self.emu.input_needed > 0:
+            if self.timer.isActive():
+                self.was_running_before_input = True
+                self.timer.stop()
+
+            self.act_run.setIcon(
+                IconFactory.draw_icon("play", COLORS["green"])
+            )  # It's technically paused waiting
+            self.act_run.setText(
+                "Run"
+            )  # Clicking Run won't do anything until input is done
+
+            self.lbl_status.setText(" WAITING INPUT ")
+            self.lbl_status.setStyleSheet(
+                f"background-color: {COLORS['yellow']}; color: #282a36; font-weight: bold; border-radius: 4px;"
+            )
+
+            self.input_field.setEnabled(True)
+            self.input_field.setPlaceholderText(
+                f"Enter {self.emu.input_needed} value(s)..."
+            )
+            self.input_field.setFocus()
+            self.input_field.setStyleSheet(
+                f"background-color: {COLORS['yellow']}; color: black; font-weight: bold;"
+            )
+            self.dock_bottom.widget().setCurrentIndex(0)
+
+        elif self.timer.isActive():
+            self.act_run.setIcon(IconFactory.draw_icon("pause", COLORS["yellow"]))
+            self.act_run.setText("Pause")
+            self.lbl_status.setText(" RUNNING ")
+            self.lbl_status.setStyleSheet(
+                f"background-color: {COLORS['green']}; color: #282a36; font-weight: bold; border-radius: 4px;"
+            )
+            self.input_field.setEnabled(False)
+            self.input_field.setStyleSheet(
+                f"background-color: {COLORS['input_bg']}; color: {COLORS['fg']};"
+            )
+
+        else:
+            # Paused or Ready
+            self.act_run.setIcon(IconFactory.draw_icon("play", COLORS["green"]))
+            self.act_run.setText("Run")
+            if not self.emu.is_finished:
+                self.lbl_status.setText(" PAUSED ")
+                self.lbl_status.setStyleSheet(
+                    f"background-color: {COLORS['orange']}; color: #282a36; font-weight: bold; border-radius: 4px;"
+                )
+            self.input_field.setEnabled(False)
+            self.input_field.setStyleSheet(
+                f"background-color: {COLORS['input_bg']}; color: {COLORS['fg']};"
+            )
+
+        self.update_inspector()
+
+    def update_inspector(self):
+        # Combined Memory Map: Address | Name (if reg) | Value
+
+        # 1. Gather all unique addresses (Variables + Touched Memory)
+        all_addrs = set(self.emu.registers.values()) | self.emu.touched_memory
+        sorted_addrs = sorted(list(all_addrs))
+
+        # Map Address -> Variable Name
+        addr_to_name = {v: k for k, v in self.emu.registers.items()}
+
+        self.table_mem.blockSignals(True)
+        self.table_mem.setRowCount(len(sorted_addrs))
+
+        for row, addr in enumerate(sorted_addrs):
+            val = 0
+            try:
+                if isinstance(self.emu.memory, list):
+                    if addr < len(self.emu.memory):
+                        val = self.emu.memory[addr]
+                else:
+                    val = self.emu.memory.get(addr, 0)
+            except:
+                pass
+
+            name = addr_to_name.get(addr, "")
+
+            item_addr = QTableWidgetItem(str(addr))
+            item_addr.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+
+            item_name = QTableWidgetItem(name)
+            item_name.setForeground(QColor(COLORS["orange"]))
+            item_name.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+
+            item_val = QTableWidgetItem(str(val))
+            item_val.setForeground(QColor(COLORS["cyan"]))
+
+            self.table_mem.setItem(row, 0, item_addr)
+            self.table_mem.setItem(row, 1, item_name)
+            self.table_mem.setItem(row, 2, item_val)
+
+        self.table_mem.blockSignals(False)
+
+    def handle_memory_edit(self, item):
+        # Only allow editing Value column (index 2)
+        if item.column() != 2:
+            return
+
+        row = item.row()
+        addr_item = self.table_mem.item(row, 0)  # Address is col 0
+        if not addr_item:
+            return
+
+        try:
+            addr = int(addr_item.text())
+            val = int(item.text())
+
+            if isinstance(self.emu.memory, list):
+                if addr < len(self.emu.memory):
+                    self.emu.memory[addr] = val
+            else:
+                self.emu.memory[addr] = val
+        except:
+            pass
+
+    def handle_input(self):
+        text = self.input_field.text()
+        if not text:
+            return
+
+        if self.emu.provide_input(text):
+            self.console_out.append(
+                f"<span style='color:{COLORS['yellow']}'>IN &lt; {text}</span>"
+            )
+            self.input_field.clear()
+            self.update_ui()  # Updates status
+
+            # Auto-Resume logic
+            if self.emu.input_needed == 0:
+                self.input_field.setEnabled(False)
+                self.input_field.setStyleSheet(
+                    f"background-color: {COLORS['input_bg']}; color: {COLORS['fg']};"
+                )
+
+                # If we were running before input paused us, resume now
+                if self.was_running_before_input:
+                    self.timer.start(self.spin_speed.value())
+                    self.update_ui()
+        else:
+            QMessageBox.warning(self, "Input Error", "Invalid Integer Input")
+
+    def open_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open File", "", "Assembly (*.asm *.txt)"
+        )
+        if path:
+            with open(path, "r") as f:
+                self.editor.setPlainText(f.read())
+            self.current_file_path = path
+            self.load_program()
+
+    def save_file(self):
+        if not self.current_file_path:
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Save File", "", "Assembly (*.asm)"
+            )
+            if not path:
+                return
+            self.current_file_path = path
+        with open(self.current_file_path, "w") as f:
+            f.write(self.editor.toPlainText())
+
     def load_default_code(self):
-        default_code = """; Click left margin to toggle breakpoints
+        code = """; PicoComputer Example
 M = 1
 N = 2
 R = 3
@@ -805,362 +1159,11 @@ SUB R, M, R  ; R = M - R
 MOV M, N     ; M = N
 MOV N, R     ; N = R
 BGT R, 0, LOOP
-OUT M, 1     ; Output
+OUT M, 1     ; Output GCD
 STOP
 """
-        self.editor.setPlainText(default_code)
-        # Manually load it so the entry point is calculated
+        self.editor.setPlainText(code)
         self.load_program()
-
-    def open_file(self):
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Open Assembly File",
-            "",
-            "Assembly Files (*.asm *.txt);;All Files (*)",
-        )
-        if file_path:
-            with open(file_path, "r") as f:
-                self.editor.setPlainText(f.read())
-            self.current_file_path = file_path
-            self.console_out.append(f">>> Loaded: {file_path}")
-            self.load_program()
-
-    def save_file(self):
-        if not self.current_file_path:
-            file_path, _ = QFileDialog.getSaveFileName(
-                self, "Save Assembly File", "", "Assembly Files (*.asm);;All Files (*)"
-            )
-            if not file_path:
-                return
-            self.current_file_path = file_path
-
-        with open(self.current_file_path, "w") as f:
-            f.write(self.editor.toPlainText())
-        self.console_out.append(f">>> Saved: {self.current_file_path}")
-
-    def build_sourcemap(self, code_text):
-        self.pc_to_line_map = {}
-        lines = code_text.split("\n")
-        current_address = 0
-
-        def is_instruction(line):
-            line = line.split(";")[0].strip()
-            if not line:
-                return False
-            if line.endswith(":"):
-                return False
-            parts = line.split()
-            if not parts:
-                return False
-
-            nonlocal current_address
-            if parts[0].upper() == "ORG" and len(parts) > 1:
-                try:
-                    current_address = int(parts[1])
-                except:
-                    pass
-                return False
-
-            if "=" in line:
-                return False
-            return True
-
-        for i, line in enumerate(lines):
-            if is_instruction(line):
-                self.pc_to_line_map[current_address] = i
-                current_address += 1
-
-    def load_program(self):
-        # 1. Sanitize Input
-        code = self.editor.toPlainText()
-
-        try:
-            # 2. Parse Code
-            self.emu.parse(code)
-            self.build_sourcemap(code)
-
-            # 3. Determine Entry Point
-            # The emulator.parse method leaves self.emu.pc at the ORG address
-            # (if defined) because of how ORG directives set pc.
-            # We capture this value now as the definitive reset point.
-            self.program_entry_point = self.emu.pc
-
-            self.console_out.clear()
-            self.console_out.append(
-                f">>> Build Successful. Entry Point: {self.program_entry_point}"
-            )
-
-            self.act_run.setEnabled(True)
-            self.act_step.setEnabled(True)
-            self.lbl_status.setText("READY")
-            self.lbl_status.setStyleSheet(
-                f"color: {COLORS['green']}; font-weight: bold;"
-            )
-
-            self.mem_table.setRowCount(0)
-            self.table_items_cache = {}
-            self.editor.set_execution_line(-1)
-            self.is_auto_running = False
-            self.is_code_dirty = False
-
-            # Reset Cycle Count
-            self.cycle_count = 0
-            self.update_ui()
-
-            return True
-
-        except Exception as e:
-            self.console_out.append(f"ERR> {str(e)}")
-            self.lbl_status.setText("PARSE ERROR")
-            self.lbl_status.setStyleSheet(f"color: {COLORS['red']}; font-weight: bold;")
-            QMessageBox.critical(self, "Parse Error", str(e))
-            return False
-
-    def reset_program(self):
-        """Re-loads the program to ensure memory is wiped and state is fresh."""
-        self.timer.stop()
-        self.is_auto_running = False
-        self.act_run.setText("Run")
-
-        # Reloading ensures 'Hard Reset' behavior (Memory Cleared)
-        if self.load_program():
-            # Force PC to entry point in case load_program didn't set it
-            # (though load_program usually sets it via parse)
-            self.emu.pc = self.program_entry_point
-            self.update_ui()
-
-    def toggle_run(self):
-        # Auto-Build if dirty
-        if self.is_code_dirty:
-            success = self.load_program()
-            if not success:
-                return  # Do not run if build failed
-
-        if self.timer.isActive():
-            # STOPPING
-            self.timer.stop()
-            self.is_auto_running = False
-            self.act_run.setText("Run")
-            self.lbl_status.setText("PAUSED")
-            self.lbl_status.setStyleSheet(
-                f"color: {COLORS['orange']}; font-weight: bold;"
-            )
-        else:
-            # STARTING
-            if self.emu.is_finished:
-                # Reset if finished
-                self.emu.pc = self.program_entry_point
-                self.emu.is_finished = False
-                self.emu.input_needed = 0
-                self.cycle_count = 0
-                self.emu.output_buffer = []
-                self.console_out.append(">>> Restarting...")
-
-            # FIX: Handling starting FROM a breakpoint
-            current_line = self.pc_to_line_map.get(self.emu.pc, -1)
-            if current_line in self.editor.breakpoints:
-                # Step ONCE to move off the breakpoint line
-                self.step_execution()
-
-                # If that single step finished the program or required input, stop here.
-                if self.emu.is_finished or self.emu.input_needed > 0:
-                    return
-
-            # Now we are safely off the breakpoint, start the timer
-            self.is_auto_running = True
-            self.timer.start(self.slider_speed.value())
-            self.act_run.setText("Stop")
-            self.lbl_status.setText("RUNNING")
-            self.lbl_status.setStyleSheet(
-                f"color: {COLORS['green']}; font-weight: bold;"
-            )
-
-    def manual_step(self):
-        if self.is_code_dirty:
-            success = self.load_program()
-            if not success:
-                return
-
-        self.timer.stop()
-        self.is_auto_running = False
-        self.act_run.setText("Run")
-        self.step_execution()
-
-    def step_execution(self):
-        # 1. Breakpoint Check
-        current_line = self.pc_to_line_map.get(self.emu.pc, -1)
-        if self.is_auto_running and current_line in self.editor.breakpoints:
-            self.timer.stop()
-            self.is_auto_running = False
-            self.act_run.setText("Run")
-            self.lbl_status.setText("BREAKPOINT")
-            self.lbl_status.setStyleSheet(f"color: {COLORS['red']}; font-weight: bold;")
-            self.console_out.append(
-                f"LOG> Paused at Breakpoint (Line {current_line+1})"
-            )
-            self.editor.set_execution_line(current_line)
-            return
-
-        # 2. Status Check (Fix for Cycle Counting Issue)
-        # If already finished or waiting, do not step and do not increment cycles
-        if self.emu.is_finished or self.emu.input_needed > 0:
-            self.update_ui()
-            return
-
-        # 3. Perform Step
-        self.emu.step()
-        self.cycle_count += 1
-        self.update_ui()
-
-    def handle_memory_edit(self, item):
-        if item.column() != 2:
-            return
-
-        row = item.row()
-        addr_item = self.mem_table.item(row, 1)
-        if not addr_item:
-            return
-
-        try:
-            addr = int(addr_item.text())
-            new_val_str = item.text()
-            new_val = int(new_val_str)
-
-            if isinstance(self.emu.memory, list):
-                if 0 <= addr < len(self.emu.memory):
-                    self.emu.memory[addr] = new_val
-                    self.console_out.append(f"LOG> Memory [{addr}] set to {new_val}")
-
-        except ValueError:
-            QMessageBox.warning(self, "Invalid Value", "Please enter a valid integer.")
-            self.update_ui()
-
-    def update_ui(self):
-        self.lbl_pc.setText(f"PC: {self.emu.pc}")
-        self.lbl_cycles.setText(f"CYCLES: {self.cycle_count}")
-
-        if self.app_settings["highlight_execution"]:
-            line_idx = self.pc_to_line_map.get(self.emu.pc, -1)
-            self.editor.set_execution_line(line_idx)
-
-        # Output logic
-        if self.emu.output_buffer:
-            for line in self.emu.output_buffer:
-                self.console_out.append(f"OUT> {line}")
-                self.console_out.verticalScrollBar().setValue(
-                    self.console_out.verticalScrollBar().maximum()
-                )
-            self.emu.output_buffer = []
-
-        # Status checks
-        if self.emu.is_finished:
-            self.timer.stop()
-            self.is_auto_running = False
-            self.act_run.setText("Run")
-            if self.emu.last_error:
-                self.lbl_status.setText("RUNTIME ERROR")
-                self.lbl_status.setStyleSheet(
-                    f"color: {COLORS['red']}; font-weight: bold;"
-                )
-                self.console_out.append(f"ERR> {self.emu.last_error}")
-            else:
-                self.lbl_status.setText("FINISHED")
-                self.lbl_status.setStyleSheet(
-                    f"color: {COLORS['cyan']}; font-weight: bold;"
-                )
-                self.console_out.append(">>> Execution Finished.")
-
-        elif self.emu.input_needed > 0:
-            if self.timer.isActive():
-                self.timer.stop()
-                self.act_run.setText("Run")
-
-            self.lbl_status.setText(f"WAITING INPUT ({self.emu.input_needed})")
-            self.lbl_status.setStyleSheet(
-                f"color: {COLORS['yellow']}; font-weight: bold;"
-            )
-            self.input_field.setEnabled(True)
-            self.input_field.setStyleSheet(
-                f"background-color: {COLORS['yellow']}; color: black; border: 2px solid {COLORS['orange']};"
-            )
-            self.input_field.setFocus()
-        else:
-            self.input_field.setEnabled(False)
-            self.input_field.setStyleSheet(
-                f"background-color: {COLORS['input_bg']}; color: {COLORS['fg']};"
-            )
-
-        # --- REBUILT MEMORY TABLE LOGIC ---
-        # 1. Gather all addresses to display
-        #    This combines named variables (registers) AND any memory address
-        #    that has been written to (touched_memory)
-        all_addresses = set(self.emu.registers.values()) | self.emu.touched_memory
-        sorted_addresses = sorted(list(all_addresses))
-
-        # Map Address -> Name for display
-        addr_to_name = {v: k for k, v in self.emu.registers.items()}
-
-        # 2. Rebuild the table entirely
-        self.mem_table.blockSignals(True)  # Prevent events while building
-        self.mem_table.setRowCount(len(sorted_addresses))
-
-        for row, addr in enumerate(sorted_addresses):
-            # Retrieve value safely
-            val = 0
-            try:
-                if isinstance(self.emu.memory, list):
-                    val = self.emu.memory[addr]
-                else:
-                    val = self.emu.memory.get(addr, 0)
-            except:
-                val = 0
-
-            var_name = addr_to_name.get(addr, "")
-
-            # Create fresh items for this row
-            i_name = QTableWidgetItem(var_name)
-            i_name.setForeground(QColor(COLORS["orange"]))
-            i_name.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)  # Read-only
-
-            i_addr = QTableWidgetItem(str(addr))
-            i_addr.setTextAlignment(Qt.AlignCenter)
-            i_addr.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)  # Read-only
-
-            i_val = QTableWidgetItem(str(val))
-            i_val.setTextAlignment(Qt.AlignCenter)
-            i_val.setForeground(QColor(COLORS["cyan"]))
-            i_val.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
-
-            self.mem_table.setItem(row, 0, i_name)
-            self.mem_table.setItem(row, 1, i_addr)
-            self.mem_table.setItem(row, 2, i_val)
-
-        self.mem_table.blockSignals(False)
-        # --- END TABLE LOGIC ---
-
-    def handle_input(self):
-        text = self.input_field.text()
-        if not text:
-            return
-
-        if self.emu.provide_input(text):
-            self.console_out.append(f"IN < {text}")
-            self.input_field.clear()
-            self.update_ui()
-
-            if self.emu.input_needed == 0:
-                if self.is_auto_running:
-                    self.act_run.setText("Stop")
-                    self.lbl_status.setText("RUNNING")
-                    self.lbl_status.setStyleSheet(
-                        f"color: {COLORS['green']}; font-weight: bold;"
-                    )
-                    self.timer.start(self.slider_speed.value())
-                else:
-                    self.lbl_status.setText("READY")
-        else:
-            QMessageBox.warning(self, "Input Error", "Invalid Integer")
 
 
 def main():
@@ -1169,7 +1172,3 @@ def main():
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
-
-
-if __name__ == "__main__":
-    main()
