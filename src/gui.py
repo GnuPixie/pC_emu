@@ -487,7 +487,7 @@ class MainWindow(QMainWindow):
 
         self.app_settings = {"highlight_execution": True}
 
-        self.ignore_breakpoint_once = False 
+        self.ignore_breakpoint_once = False
 
         self.apply_styles()
 
@@ -962,11 +962,11 @@ STOP
             if current_line in self.editor.breakpoints:
                 # Step ONCE to move off the breakpoint line
                 self.step_execution()
-                
+
                 # If that single step finished the program or required input, stop here.
                 if self.emu.is_finished or self.emu.input_needed > 0:
                     return
-            
+
             # Now we are safely off the breakpoint, start the timer
             self.is_auto_running = True
             self.timer.start(self.slider_speed.value())
@@ -1093,16 +1093,16 @@ STOP
 
         # --- REBUILT MEMORY TABLE LOGIC ---
         # 1. Gather all addresses to display
-        #    This combines named variables (registers) AND any memory address 
+        #    This combines named variables (registers) AND any memory address
         #    that has been written to (touched_memory)
         all_addresses = set(self.emu.registers.values()) | self.emu.touched_memory
         sorted_addresses = sorted(list(all_addresses))
-        
+
         # Map Address -> Name for display
         addr_to_name = {v: k for k, v in self.emu.registers.items()}
 
         # 2. Rebuild the table entirely
-        self.mem_table.blockSignals(True) # Prevent events while building
+        self.mem_table.blockSignals(True)  # Prevent events while building
         self.mem_table.setRowCount(len(sorted_addresses))
 
         for row, addr in enumerate(sorted_addresses):
@@ -1121,11 +1121,11 @@ STOP
             # Create fresh items for this row
             i_name = QTableWidgetItem(var_name)
             i_name.setForeground(QColor(COLORS["orange"]))
-            i_name.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable) # Read-only
+            i_name.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)  # Read-only
 
             i_addr = QTableWidgetItem(str(addr))
             i_addr.setTextAlignment(Qt.AlignCenter)
-            i_addr.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable) # Read-only
+            i_addr.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)  # Read-only
 
             i_val = QTableWidgetItem(str(val))
             i_val.setTextAlignment(Qt.AlignCenter)
