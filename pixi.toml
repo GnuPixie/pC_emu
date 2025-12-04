@@ -7,12 +7,17 @@ channels = ["conda-forge"]
 platforms = ["linux-64", "win-64", "osx-64", "osx-arm64"]
 
 [tasks]
+# Run the app normally
 start = "python src/main.py"
+# Format code
 fmt = "black ."
+# Build the single .exe file
+build = "pyinstaller --noconsole --onefile --name PicoEmulator --clean src/main.py"
 
 [dependencies]
 python = ">=3.9,<=3.14"
 pyside6 = "*"
+pyinstaller = "*" 
 
 [feature.dev.dependencies]
 black = "*"
